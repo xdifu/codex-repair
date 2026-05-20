@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# Toolkit runtime artifacts (these are produced by `codex-repair.py`, not source)
+.dry-run-cache/
+codex-repair-doctor-*/
+codex-repair-fix-*/
+codex-repair-backfill-*/
+
+# DB backups (may contain real session metadata; should never be committed)
+*.bak-*
+*.broken*
+*.pre-manual-backfill-*
+state_5.sqlite*
+logs_2.sqlite*
+
+# JSON dumps of binary checksums (re-generate with `extract-checksums --json`)
+codex-checksums-*.json
+checksums.json
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.iml
+
+# Secrets (just in case)
+*.pem
+*.key
+config.local.toml
