@@ -161,42 +161,54 @@ class BackfillStatus:
 
 
 class Console:
-    """Tiny color/no-color console helper."""
+    """Tiny color/no-color console helper. Writes to `stream` (default stdout).
 
-    def __init__(self, verbose: bool = False):
+    When emitting machine-readable output to stdout (e.g. `extract-checksums
+    --json`), construct with `stream=sys.stderr` so progress decoration doesn't
+    pollute the data stream.
+    """
+
+    def __init__(self, verbose: bool = False, stream=None):
         self.verbose = verbose
-        self._use_color = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+        self.stream = stream if stream is not None else sys.stdout
+        self._use_color = (
+            getattr(self.stream, "isatty", lambda: False)()
+            and os.environ.get("NO_COLOR") is None
+        )
 
     def _c(self, code: str, msg: str) -> str:
         if not self._use_color:
             return msg
         return f"\x1b[{code}m{msg}\x1b[0m"
 
+    def _p(self, msg: str = "") -> None:
+        print(msg, file=self.stream)
+
     def header(self, msg: str) -> None:
-        print()
-        print(self._c("1;36", "=" * 78))
-        print(self._c("1;36", f"  {msg}"))
-        print(self._c("1;36", "=" * 78))
+        self._p()
+        self._p(self._c("1;36", "=" * 78))
+        self._p(self._c("1;36", f"  {msg}"))
+        self._p(self._c("1;36", "=" * 78))
 
     def section(self, msg: str) -> None:
-        print()
-        print(self._c("1;33", f"▶ {msg}"))
+        self._p()
+        self._p(self._c("1;33", f"▶ {msg}"))
 
     def ok(self, msg: str) -> None:
-        print(self._c("32", f"  ✓ {msg}"))
+        self._p(self._c("32", f"  ✓ {msg}"))
 
     def warn(self, msg: str) -> None:
-        print(self._c("33", f"  ⚠ {msg}"))
+        self._p(self._c("33", f"  ⚠ {msg}"))
 
     def err(self, msg: str) -> None:
-        print(self._c("31", f"  ✗ {msg}"))
+        self._p(self._c("31", f"  ✗ {msg}"))
 
     def info(self, msg: str) -> None:
-        print(f"    {msg}")
+        self._p(f"    {msg}")
 
     def debug(self, msg: str) -> None:
         if self.verbose:
-            print(self._c("90", f"    [dbg] {msg}"))
+            self._p(self._c("90", f"    [dbg] {msg}"))
 
 
 con = Console()  # global; reconfigured in main()
@@ -1470,19 +1482,8 @@ def cmd_fix(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="codex-repair",
-        description="Unified repair tool for Codex Desktop (Windows + WSL backend).",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  python codex-repair.py doctor\n"
-            "  python codex-repair.py fix                   # dry-run\n"
-            "  python codex-repair.py fix --apply           # actually repair\n"
-            "  python codex-repair.py doctor --use-isolated-copy  # zero risk to running Codex\n"
-        ),
-    )
+def _add_global_flags(p: argparse.ArgumentParser) -> None:
+    """Add the global flags to a (sub)parser so they work in any position."""
     p.add_argument(
         "--codex-home",
         default=str(DEFAULT_CODEX_HOME),
@@ -1505,21 +1506,66 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("-v", "--verbose", action="store_true")
 
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="codex-repair",
+        description="Unified repair tool for Codex Desktop (Windows + WSL backend).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python codex-repair.py doctor\n"
+            "  python codex-repair.py fix                   # dry-run\n"
+            "  python codex-repair.py fix --apply           # actually repair\n"
+            "  python codex-repair.py doctor --use-isolated-copy  # zero risk to running Codex\n"
+        ),
+    )
+    _add_global_flags(p)
     sub = p.add_subparsers(dest="cmd")
-    sub.add_parser("doctor", help="Diagnose only (read-only)")
-    sub.add_parser("fix", help="Auto-detect and fix all issues (dry-run unless --apply)")
-    sub.add_parser("fix-checksums", help="Only fix migration checksum drift")
-    sub.add_parser("manual-backfill", help="Only do manual thread metadata backfill")
+    for name, help_text in (
+        ("doctor", "Diagnose only (read-only)"),
+        ("fix", "Auto-detect and fix all issues (dry-run unless --apply)"),
+        ("fix-checksums", "Only fix migration checksum drift"),
+        ("manual-backfill", "Only do manual thread metadata backfill"),
+    ):
+        sp = sub.add_parser(name, help=help_text)
+        _add_global_flags(sp)
     extract = sub.add_parser("extract-checksums", help="List all migration checksums from binary")
+    _add_global_flags(extract)
     extract.add_argument("--json", action="store_true", help="output JSON")
     return p
+
+
+def _merge_global_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """When global flags appear after the subcommand, the subparser owns them.
+    When they appear before, the top-level parser owns them. We just need to
+    ensure all known global attrs exist on `args`; argparse already does that
+    because we attached `_add_global_flags` to every subparser.
+    """
+    # Defensive: ensure attributes exist with their defaults if argparse missed.
+    for attr, default in (
+        ("codex_home", str(DEFAULT_CODEX_HOME)),
+        ("binary", None),
+        ("apply", False),
+        ("use_isolated_copy", False),
+        ("verbose", False),
+    ):
+        if not hasattr(args, attr):
+            setattr(args, attr, default)
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    _merge_global_args(args, parser)
+
+    # Route progress messages to stderr when the subcommand emits machine-
+    # readable output to stdout (currently only `extract-checksums --json`),
+    # so redirecting stdout to a file gives a clean data stream.
+    json_mode = (args.cmd == "extract-checksums") and getattr(args, "json", False)
     global con
-    con = Console(verbose=args.verbose)
+    con = Console(verbose=args.verbose, stream=sys.stderr if json_mode else sys.stdout)
+
     if args.use_isolated_copy and args.apply:
         con.warn("--use-isolated-copy implies dry-run; ignoring --apply")
         args.apply = False
