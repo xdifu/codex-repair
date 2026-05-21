@@ -43,15 +43,21 @@ cd codex-repair
 .\repair.ps1 -Mode fix -Apply
 ```
 
-Or call the Python script directly (cross-platform):
+If you prefer to call the Python script directly, keep the target Codex home explicit:
 
 ```bash
-python codex-repair.py doctor                          # diagnose
-python codex-repair.py doctor --use-isolated-copy      # diagnose, zero contact with live DB
-python codex-repair.py fix                             # auto-detect & dry-run
-python codex-repair.py fix --apply                     # actually repair
-python codex-repair.py extract-checksums --json        # dump binary's expected checksums
-python codex-repair.py -h                              # full help
+# Native macOS / Linux Codex home:
+python codex-repair.py doctor
+python codex-repair.py fix --apply
+
+# WSL bash repairing Windows Store Codex Desktop data:
+python codex-repair.py doctor --codex-home "/mnt/c/Users/<WindowsUser>/.codex"
+python codex-repair.py fix --apply --codex-home "/mnt/c/Users/<WindowsUser>/.codex"
+
+# Useful read-only helpers:
+python codex-repair.py doctor --use-isolated-copy
+python codex-repair.py extract-checksums --json
+python codex-repair.py -h
 ```
 
 Typical full repair: under 5 minutes start-to-finish, including DB backups.
@@ -113,8 +119,8 @@ Full technical archeology in [`docs/root-cause-analysis.md`](docs/root-cause-ana
 
 ```
 codex-repair\
-├── codex-repair.py     ← the only script you need; everything is here
-├── repair.ps1          ← Windows-friendly wrapper (interactive prompts)
+├── codex-repair.py     ← core Python repair script
+├── repair.ps1          ← Windows-friendly wrapper (recommended on Windows)
 ├── README.md           ← this file
 ├── docs\
 │   ├── root-cause-analysis.md    ← deep technical writeup
@@ -139,7 +145,7 @@ codex-repair\
 
 | Flag | Meaning |
 |------|---------|
-| `--codex-home PATH` | Codex home dir. Default `%USERPROFILE%\.codex`. |
+| `--codex-home PATH` | Codex home dir. Default `%USERPROFILE%\.codex` on Windows, otherwise `~/.codex`. If running in WSL to repair Windows Store Codex Desktop data, pass `/mnt/c/Users/<WindowsUser>/.codex` explicitly. |
 | `--binary PATH`     | Backend binary. Default: auto-detect newest in `{codex-home}\bin\wsl\*\codex` (falls back to `bin\codex.exe`). |
 | `--apply`           | Actually mutate the DB. Without this, every subcommand runs dry-run. |
 | `--use-isolated-copy` | Copy the DBs to a temp dir, then operate on copies. The live DB is never opened. Implies dry-run. **Recommended whenever Codex is running.** |
@@ -157,6 +163,8 @@ codex-repair\
 | `21` | A required database file is missing. |
 | `30` | User aborted. |
 | `1`  | Other error. |
+
+If WSL prints `CODEX_HOME = /home/<you>/.codex` and then `no backend binary found`, it is looking at the WSL Codex home, not the Windows Store Codex Desktop home. Use `repair.ps1` from PowerShell, or pass `--codex-home "/mnt/c/Users/<WindowsUser>/.codex"` explicitly.
 
 ## Safety guarantees
 
