@@ -11,6 +11,8 @@
 
 If you just updated Codex Desktop on **Windows** (or macOS / Linux) and now see one of these dialogs:
 
+![Redacted screenshot of the Codex local database startup error](docs/assets/codex-local-db-dialog-redacted.png)
+
 > **Codex cannot access its local database.**
 > The app cannot finish launching until its SQLite database is accessible.
 >
