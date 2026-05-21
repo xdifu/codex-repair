@@ -118,6 +118,7 @@ class BinaryAnchor:
     sql_len: int
     checksum_hex: str
     sql_first_line: str  # for human display only
+    sql_full_lower: str = ""  # full SQL bytes lowercased, for content matching
 
     @property
     def is_create_or_alter(self) -> bool:
@@ -601,6 +602,9 @@ def scan_binary_anchors(
                                     sql_first_line=first_line_bytes.decode(
                                         "utf-8", errors="replace"
                                     ).strip(),
+                                    sql_full_lower=sql_bytes.decode(
+                                        "utf-8", errors="replace"
+                                    ).lower(),
                                 )
                             )
                             matched = True
@@ -661,6 +665,42 @@ def find_description_near(binary: Path, description: str, anchors: list[BinaryAn
 # ---------------------------------------------------------------------------
 
 
+_DESC_STOPWORDS = frozenset({
+    "add", "drop", "create", "alter", "index", "table", "column",
+    "set", "use", "with", "from", "into", "and", "the", "for",
+    "has", "have", "pragma", "select", "insert", "update", "delete",
+    "primary", "key", "not", "null", "default", "where", "rollout",
+})
+
+
+def _significant_tokens(description: str) -> list[str]:
+    """Lowercase tokens >= 3 chars, excluding generic SQL/English stopwords."""
+    if not description:
+        return []
+    return [
+        t.lower()
+        for t in description.replace("_", " ").split()
+        if len(t) >= 3 and t.lower() not in _DESC_STOPWORDS
+    ]
+
+
+def _description_matches_anchor(description: str, anchor: BinaryAnchor) -> bool:
+    """At least one significant description token appears in the anchor's full SQL.
+
+    Tokens are matched as plain substrings against the lowercased full SQL, so
+    'thread' matches inside 'thread_id', 'usage' inside 'usage_count', etc.
+    An empty token list (description is all-stopwords) passes neutrally.
+    """
+    tokens = _significant_tokens(description)
+    if not tokens:
+        return True
+    sql = anchor.sql_full_lower
+    for t in tokens:
+        if t in sql or t.replace(" ", "_") in sql:
+            return True
+    return False
+
+
 def match_db_rows_to_anchors(
     db_path: Path,
     db_rows: list[MigrationRow],
@@ -669,41 +709,61 @@ def match_db_rows_to_anchors(
 ) -> list[tuple[MigrationRow, Optional[BinaryAnchor]]]:
     """For each DB migration row, find the matching binary anchor.
 
-    Matching strategy (in order):
-      1. checksum equality (DB row matches binary directly → no drift)
-      2. description-proximity search in binary
-      3. ordered fallback (Nth DB row → Nth anchor) when description has no near anchor
+    Two-pass strategy:
+      1. Exact checksum match (no drift; trivial case).
+      2. Version-order greedy: sqlx stores each DB's migrations contiguously in
+         the binary in version order, so we walk anchors in offset order and
+         assign each unmatched DB row to the next anchor whose full SQL contains
+         at least one significant token from the DB row's description. If no
+         content-match anchor is found between the cursor and the next exact
+         match, fall back to the immediate-next position. Each anchor is used at
+         most once.
+
+    `binary` is no longer needed by this function (full SQL is on the anchor),
+    but the signature is preserved for callers.
     """
-    by_cksum: dict[str, BinaryAnchor] = {a.checksum_hex: a for a in anchors}
+    del binary  # kept in signature for API stability
+    anchors_sorted = sorted(anchors, key=lambda a: a.offset)
+    by_cksum: dict[str, BinaryAnchor] = {a.checksum_hex: a for a in anchors_sorted}
     matched: list[tuple[MigrationRow, Optional[BinaryAnchor]]] = []
     used_offsets: set[int] = set()
 
     # First pass: exact checksum match.
-    pending: list[tuple[int, MigrationRow]] = []
-    for idx, row in enumerate(db_rows):
+    for row in db_rows:
         a = by_cksum.get(row.checksum_hex)
         if a is not None:
             matched.append((row, a))
             used_offsets.add(a.offset)
         else:
             matched.append((row, None))
-            pending.append((idx, row))
 
-    # Second pass: for unmatched, try description proximity.
-    if pending:
-        for idx, row in pending:
-            cand = find_description_near(binary, row.description, anchors)
-            if cand is not None and cand.offset not in used_offsets:
-                matched[idx] = (row, cand)
-                used_offsets.add(cand.offset)
-
-    # Third pass: ordered fallback for any still-unmatched.
-    # We assume binary stores migrations in version order.
-    free_anchors = [a for a in anchors if a.offset not in used_offsets]
-    # Sort DB rows that are still unmatched by version
-    remaining = [(i, r) for i, (r, a) in enumerate(matched) if a is None]
-    for (i, row), a in zip(remaining, free_anchors):
-        matched[i] = (row, a)
+    # Second pass: version-order greedy for unmatched rows.
+    # The cursor is the offset of the most recently matched anchor; the next row
+    # must match at a strictly greater offset.
+    cursor_offset = -1
+    for i, (row, m) in enumerate(matched):
+        if m is not None:
+            if m.offset > cursor_offset:
+                cursor_offset = m.offset
+            continue
+        # Find first available anchor with offset > cursor that content-matches.
+        chosen: Optional[BinaryAnchor] = None
+        for a in anchors_sorted:
+            if a.offset <= cursor_offset or a.offset in used_offsets:
+                continue
+            if _description_matches_anchor(row.description, a):
+                chosen = a
+                break
+        # Position fallback: if no content match, take the immediate-next available.
+        if chosen is None:
+            for a in anchors_sorted:
+                if a.offset > cursor_offset and a.offset not in used_offsets:
+                    chosen = a
+                    break
+        if chosen is not None:
+            matched[i] = (row, chosen)
+            used_offsets.add(chosen.offset)
+            cursor_offset = chosen.offset
 
     return matched
 
@@ -774,11 +834,47 @@ def expected_columns_from_sql(binary: Path, anchor: BinaryAnchor) -> set[str]:
     return cols
 
 
-def check_schema_compat(db_path: Path, anchor: BinaryAnchor, binary: Path) -> tuple[bool, list[str]]:
+def _table_dropped_or_rebuilt_later(
+    table_name: str,
+    anchor: BinaryAnchor,
+    all_anchors: list[BinaryAnchor],
+) -> bool:
+    """Return True if some anchor at a later offset drops, renames, or rebuilds the table.
+
+    Detects:
+      * `DROP TABLE <name>` / `DROP TABLE IF EXISTS <name>`
+      * `ALTER TABLE <name> RENAME TO ...`  (rebuild idiom for sqlite column renames:
+        rename, recreate, copy, drop_old)
+    Comparison is on the lowercased full SQL so e.g. state_5 m23's
+    `PRAGMA auto_vacuum = INCREMENTAL;\\n\\nDROP TABLE IF EXISTS logs;` is matched
+    even though its first line is just the PRAGMA.
+    """
+    tn = table_name.lower()
+    for a in all_anchors:
+        if a.offset <= anchor.offset:
+            continue
+        sql = a.sql_full_lower
+        if (
+            f"drop table {tn}" in sql
+            or f"drop table if exists {tn}" in sql
+            or f"alter table {tn} rename to" in sql
+        ):
+            return True
+    return False
+
+
+def check_schema_compat(
+    db_path: Path,
+    anchor: BinaryAnchor,
+    binary: Path,
+    all_anchors: Optional[list[BinaryAnchor]] = None,
+) -> tuple[bool, list[str]]:
     """Verify that the table targeted by `anchor`'s SQL exists with all expected columns.
 
     Returns (ok, notes). `ok=True` means it's safe to update this migration's checksum
-    without re-running the SQL (the schema is already at-or-newer).
+    without re-running the SQL (the schema is already at-or-newer, or a later
+    applied migration has since dropped or rebuilt the table the binary's SQL
+    targets).
     """
     notes: list[str] = []
     expected_cols = expected_columns_from_sql(binary, anchor)
@@ -809,11 +905,23 @@ def check_schema_compat(db_path: Path, anchor: BinaryAnchor, binary: Path) -> tu
         notes.append(f"table_info({table_name}) failed: {exc}")
         return (False, notes)
     if not actual_cols:
+        if all_anchors and _table_dropped_or_rebuilt_later(table_name, anchor, all_anchors):
+            notes.append(
+                f"table '{table_name}' missing, but a later migration drops or rebuilds it; "
+                f"checksum-only fix is safe"
+            )
+            return (True, notes)
         notes.append(f"table '{table_name}' missing — migration not applied yet")
         return (False, notes)
 
     missing = {c.lower() for c in expected_cols} - actual_cols
     if missing:
+        if all_anchors and _table_dropped_or_rebuilt_later(table_name, anchor, all_anchors):
+            notes.append(
+                f"table '{table_name}' missing columns {sorted(missing)}, "
+                f"but a later migration rebuilds it (cols renamed/dropped); safe"
+            )
+            return (True, notes)
         notes.append(
             f"table '{table_name}' missing columns: {sorted(missing)} "
             f"(actual schema older than binary expects)"
@@ -844,7 +952,7 @@ def compute_checksum_diffs(
             continue
         if row.checksum_hex == anchor.checksum_hex:
             continue  # match, no drift
-        ok, notes = check_schema_compat(db_path, anchor, binary)
+        ok, notes = check_schema_compat(db_path, anchor, binary, all_anchors=anchors)
         diffs.append(
             ChecksumDiff(
                 db_path=db_path,
