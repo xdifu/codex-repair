@@ -23,7 +23,6 @@ param(
     [switch]$Isolated,
     [string]$CodexHome = "$env:USERPROFILE\.codex",
     [string]$Binary,
-    [switch]$Verbose,
     [switch]$NoPrompt
 )
 
@@ -78,7 +77,7 @@ if (-not (Test-Path -LiteralPath $pyScript)) {
 # Build base argument list for the Python script
 $pyArgs = @("--codex-home", $CodexHome)
 if ($Binary)    { $pyArgs += @("--binary", $Binary) }
-if ($Verbose)   { $pyArgs += "-v" }
+if ($VerbosePreference -ne 'SilentlyContinue') { $pyArgs += "-v" }
 if ($Isolated)  { $pyArgs += "--use-isolated-copy" }
 if ($Apply)     { $pyArgs += "--apply" }
 
