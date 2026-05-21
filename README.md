@@ -2,24 +2,94 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
-[![Upstream issue](https://img.shields.io/badge/upstream-openai%2Fcodex%2323251-red.svg)](https://github.com/openai/codex/issues/23251)
+[![Upstream issue](https://img.shields.io/badge/upstream-openai%2Fcodex%2323787-red.svg)](https://github.com/openai/codex/issues/23787)
+[![Sibling issue](https://img.shields.io/badge/sibling-openai%2Fcodex%2323777-orange.svg)](https://github.com/openai/codex/issues/23777)
 
-> Maintained by [**@xdifu**](https://github.com/xdifu). Contributions and bug
-> reports welcome via Issues.
+> Maintained by [**@xdifu**](https://github.com/xdifu). Issues + PRs welcome.
 
-Unified repair tool for **Codex Desktop on Windows + WSL backend**.
+**Fix the "Codex cannot access its local database" crash on Codex Desktop after the `0.130 → 0.131` auto-update — without losing any conversations.**
 
-Handles the two crash modes observed when Codex Desktop's auto-update jumps from
-`0.130.x` to `0.131.x` (or any future similar upgrade where OpenAI breaks the
-sqlx "immutable migration" contract):
+If you just updated Codex Desktop on **Windows** (or macOS / Linux) and now see one of these dialogs:
 
-1. **Migration checksum drift** — startup fails with
-   `migration X was previously applied but has been modified`.
-2. **Backfill timeout** — Codex GUI opens but errors with
-   `timed out waiting for state db backfill ... after 30s (status: running)`.
+> **Codex cannot access its local database.**
+> The app cannot finish launching until its SQLite database is accessible.
+>
+> Database path: `/mnt/c/Users/<you>/.codex/state_5.sqlite`: failed to initialize state runtime at `/mnt/c/Users/<you>/.codex`
+>
+> Most recent error: `Error: failed to initialize sqlite state db at /mnt/c/Users/<you>/.codex/state_5.sqlite: failed to initialize state runtime at /mnt/c/Users/<you>/.codex:` **`migration 1 was previously applied but has been modified`**
 
-See [`docs/root-cause-analysis.md`](docs/root-cause-analysis.md) for the full technical writeup of
-how these were discovered and why they happen.
+or, after the first symptom is patched, this one:
+
+> **An error has occurred**
+> Codex crashed with the following error:
+> `(code=1, signal=null).`
+> Most recent error: `Error: failed to initialize sqlite state db at /mnt/c/Users/<you>/.codex/state_5.sqlite:` **`timed out waiting for state db backfill at /mnt/c/Users/<you>/.codex after 30s (status: running)`**
+
+…**you are in the right place.** Both errors are **OpenAI's bug, not your computer's** (tracked upstream as [`openai/codex#23787`](https://github.com/openai/codex/issues/23787) and [`#23777`](https://github.com/openai/codex/issues/23777)). This toolkit fixes them **non-destructively, with full DB backups, SQLite schema verification, and dry-run by default**. Your conversation history (`~/.codex/sessions/*.jsonl`) is **never** touched.
+
+## tl;dr
+
+```powershell
+# 1. Clone this repo and cd into it.
+git clone https://github.com/xdifu/codex-repair.git
+cd codex-repair
+
+# 2. Diagnose only — read-only, safe to run even with Codex App still open:
+.\repair.ps1 -Mode doctor
+
+# 3. Apply the fix — offers to stop Codex first, backs up DBs, schema-verifies before any write:
+.\repair.ps1 -Mode fix -Apply
+```
+
+Or call the Python script directly (cross-platform):
+
+```bash
+python codex-repair.py doctor                          # diagnose
+python codex-repair.py doctor --use-isolated-copy      # diagnose, zero contact with live DB
+python codex-repair.py fix                             # auto-detect & dry-run
+python codex-repair.py fix --apply                     # actually repair
+python codex-repair.py extract-checksums --json        # dump binary's expected checksums
+python codex-repair.py -h                              # full help
+```
+
+Typical full repair: under 5 minutes start-to-finish, including DB backups.
+
+## Symptoms covered (verbatim error text for search engines)
+
+If you searched for any of the following and landed here, this toolkit fixes it:
+
+- `Codex cannot access its local database`
+- `failed to initialize sqlite state db at /mnt/c/Users/<you>/.codex/state_5.sqlite`
+- `failed to initialize state runtime at /mnt/c/Users/<you>/.codex`
+- `migration 1 was previously applied but has been modified`
+- `migration 2 was previously applied but has been modified` (logs_2.sqlite)
+- `migration N was previously applied but has been modified` (any N from 1 to 32)
+- `timed out waiting for state db backfill at /mnt/c/Users/<you>/.codex after 30s (status: running)`
+- `Codex crashed with the following error: (code=1, signal=null)`
+- `An error has occurred` dialog on Codex Desktop startup after auto-update
+- `Repair Codex local data now? [y/N]` prompt (do **not** accept it — it wipes thread metadata)
+- Codex Desktop sidebar suddenly empty after `0.130 → 0.131` update (related family — see [#17304](https://github.com/openai/codex/issues/17304), [#17540](https://github.com/openai/codex/issues/17540), [#18364](https://github.com/openai/codex/issues/18364), [#20608](https://github.com/openai/codex/issues/20608))
+
+## Root cause
+
+Two distinct bugs fire in sequence after a Codex Desktop `0.130.x → 0.131.x` update:
+
+### Bug A — `sqlx` migration checksum drift (CRLF vs LF line endings)
+
+First identified by [@MisterRound in `openai/codex#23777`](https://github.com/openai/codex/issues/23777) and independently corroborated in [`#23787`](https://github.com/openai/codex/issues/23787): the migration SQL bytes are identical at the source level, but:
+
+- **`0.130` on Windows** ran the **Windows-native** Codex backend, whose `include_str!`-embedded migration files had **CRLF** line endings (a side effect of the Windows checkout / build pipeline). The SHA-384 written into `_sqlx_migrations.checksum` was therefore `sha384(CRLF(SQL))`.
+- **`0.131` on Windows** switched the Codex Desktop GUI to launching the **WSL/Linux** backend ELF (`%USERPROFILE%\.codex\bin\wsl\<hash>\codex`), whose embedded migration files have **LF** line endings. The binary now expects `sha384(LF(SQL))`.
+
+`sqlx` hashes embedded SQL **byte-for-byte** with SHA-384, so identical SQL text with different line endings produces different checksums. The migrator then refuses to open any DB whose recorded checksum doesn't match — even though the resulting `CREATE TABLE` schema is **fully forward-compatible** (this toolkit verifies that explicitly before touching anything).
+
+In our 0.131.0-alpha.9 backend, affected migrations are typically rows `1..31` of `state_5.sqlite._sqlx_migrations` and/or rows `1..2` of `logs_2.sqlite._sqlx_migrations`, depending on which DB was last touched by which platform's binary.
+
+### Bug B — 30-second GUI backfill timeout
+
+After Bug A is patched, the Codex Desktop GUI imposes a hard-coded **30 s** wait for `state_5.sqlite.backfill_state.status='complete'`, even though the backend's own backfill lease is **900 s** (introduced by [PR #11377](https://github.com/openai/codex/pull/11377)). On any install with hundreds of MB of session history — particularly Windows installs where the backend reads `sessions/*.jsonl` via WSL's 9P protocol over `/mnt/c/` (5–10× slower than native APFS/ext4) — the GUI gives up while the backend is still making progress.
+
+Full technical archeology in [`docs/root-cause-analysis.md`](docs/root-cause-analysis.md).
 
 ## Quick start
 
@@ -37,21 +107,10 @@ how these were discovered and why they happen.
 .\repair.ps1 -Mode fix -Apply
 ```
 
-Or call the Python script directly:
-
-```bash
-python codex-repair.py doctor                          # diagnose
-python codex-repair.py doctor --use-isolated-copy      # diagnose, zero contact with live DB
-python codex-repair.py fix                             # auto-detect & dry-run
-python codex-repair.py fix --apply                     # actually repair
-python codex-repair.py extract-checksums               # dump binary's expected checksums
-python codex-repair.py -h                              # full help
-```
-
 ## Directory layout
 
 ```
-.codex-repair\
+codex-repair\
 ├── codex-repair.py     ← the only script you need; everything is here
 ├── repair.ps1          ← Windows-friendly wrapper (interactive prompts)
 ├── README.md           ← this file
@@ -105,32 +164,39 @@ python codex-repair.py -h                              # full help
 4. **Atomic transactions.** Every mutation is wrapped in `BEGIN IMMEDIATE … COMMIT` and rolled back on any error.
 5. **Idempotent.** Running `fix --apply` twice in a row is a no-op the second time.
 6. **`--use-isolated-copy`.** When passed, the script copies the DBs to a private temp directory and operates only on those. Your real DB is never touched, even read-only. Useful for testing while Codex is running.
+7. **Conversation data is never touched.** This toolkit only reads/writes `state_5.sqlite` and `logs_2.sqlite` (metadata / indexing DBs). Your actual chat history under `~/.codex/sessions/*.jsonl` is read-only the entire time.
 
 ## When to use this
 
 - After a Codex Desktop auto-update, you see one of these errors:
-  - `Codex couldn't start because its local database appears to be damaged. ... migration N was previously applied but has been modified`
+  - `Codex cannot access its local database` / `migration N was previously applied but has been modified`
   - `timed out waiting for state db backfill at ... after 30s (status: running)`
 - You want to verify your `.codex\` state is healthy after an upgrade.
 - You want to dump the backend's expected checksums for comparison with a friend's install or a GitHub bug report.
 
 ## When NOT to use this
 
-- If the error is something **other** than the two listed above (e.g., file permission errors, corrupted jsonl, `state_5.sqlite` truly corrupt per `PRAGMA integrity_check`). This tool will not help — it only handles the sqlx-migration-drift + backfill-timeout classes.
+- If the error is something **other** than the two listed above (e.g., file permission errors, corrupted jsonl, `state_5.sqlite` truly corrupt per `PRAGMA integrity_check`). This tool will not help — it only handles the sqlx-migration-drift + backfill-timeout classes. For genuine corruption see upstream [#21750](https://github.com/openai/codex/issues/21750).
 - If `.codex\sessions\` itself is missing or empty. This tool reconstructs **metadata** from sessions; it cannot recreate session content.
 
 ## Related upstream issues
 
-The bug being repaired here is **OpenAI's**, not your computer's. Public issues:
+The bug being repaired here is **OpenAI's**, not your computer's. Public tracking:
 
-- [#23251](https://github.com/openai/codex/issues/23251) — `WSL CLI cannot share Windows Codex App CODEX_HOME: migration 1 was previously applied but has been modified` (Open; describes one specific repro path)
-- [#17304](https://github.com/openai/codex/issues/17304) — `Desktop project sidebar hides active threads after state DB migration drift` (Open; family of related drift bugs)
-- [#16924](https://github.com/openai/codex/pull/16924) — `fix(sqlite): don't hard fail migrator if DB is newer` (Merged; fixes the OTHER direction, where DB is newer than binary)
-- [`docs/upstream-bug-report.md`](docs/upstream-bug-report.md) — paste-ready issue body / PR description for filing a comprehensive report.
+- [**#23787**](https://github.com/openai/codex/issues/23787) — `Codex App crashes after 0.130 → 0.131 auto-update: logs_2.sqlite migrations modified in place (sqlx checksum drift) + 30s GUI backfill cap incompatible with 900s backend lease` (**this toolkit's primary upstream issue**; covers both Bug A and Bug B with full evidence + proposed fixes)
+- [**#23777**](https://github.com/openai/codex/issues/23777) — `Windows Desktop WSL app-server fails to launch due to CRLF/LF SQLx migration checksum mismatch` (sibling issue; first to identify the CRLF/LF root cause for Bug A — credit [@MisterRound](https://github.com/MisterRound))
+- [#23251](https://github.com/openai/codex/issues/23251) — `WSL CLI cannot share Windows Codex App CODEX_HOME: migration 1 was previously applied but has been modified` (open; earlier subset of the same root cause filed by [@xdifu](https://github.com/xdifu))
+- [#17304](https://github.com/openai/codex/issues/17304) — `Desktop project sidebar hides active threads after state DB migration drift` (open; downstream symptom on Mac)
+- [#18364](https://github.com/openai/codex/issues/18364), [#20608](https://github.com/openai/codex/issues/20608) — Mac-side observations of the same migration-drift family
+- [#17540](https://github.com/openai/codex/issues/17540), [#19873](https://github.com/openai/codex/issues/19873) — Windows sidebar disappearance after update
+- [#21750](https://github.com/openai/codex/issues/21750) — adjacent: corrupt `state_5.sqlite` from forced shutdowns (not what this toolkit handles)
+- [#16924](https://github.com/openai/codex/pull/16924) — `fix(sqlite): don't hard fail migrator if DB is newer` (merged; fixes the **opposite** direction)
+- [#11377](https://github.com/openai/codex/pull/11377) — `feat: prevent double backfill` (introduced the 900 s backend lease that makes the 30 s GUI cap so glaringly inconsistent)
+- [`docs/upstream-bug-report.md`](docs/upstream-bug-report.md) — paste-ready issue body / PR description for filing further reports.
 
 ## Requirements
 
-- Windows 10/11 with Codex Desktop installed
+- Codex Desktop on Windows 10/11 (with WSL2 backend), macOS, or Linux
 - Python 3.10 or newer on PATH
 - The `sqlite3` module (bundled with stock Python)
 
@@ -138,7 +204,7 @@ No third-party Python packages are required.
 
 ## Authorship & history
 
-Distilled from a ~5-hour live diagnostic session on 2026-05-21 where a Codex
+Distilled from a ~5-hour live diagnostic session on 2026-05-21 in which a Codex
 Desktop update from `0.130.0-alpha.5` to `0.131.0-alpha.9` triggered both bugs
 above. The original 22 ad-hoc scripts that uncovered the root cause are
 preserved under [`archive/`](archive/) for posterity. See
