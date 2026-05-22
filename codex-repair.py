@@ -473,6 +473,18 @@ def find_backend_binary(codex_home: Path) -> Optional[Path]:
         return None
     return candidates[0][2]
 
+def resolve_db_paths(codex_home: Path) -> tuple[Path, Path]:
+    """Resolve state_5.sqlite and logs_2.sqlite paths.
+    If they exist in a 'sqlite' subdirectory under codex_home, use those.
+    Otherwise, default to directly under codex_home.
+    """
+    state_sub = codex_home / "sqlite" / STATE_DB_NAME
+    logs_sub = codex_home / "sqlite" / LOGS_DB_NAME
+    if state_sub.exists():
+        return state_sub, logs_sub
+    return codex_home / STATE_DB_NAME, codex_home / LOGS_DB_NAME
+
+
 def detect_rollout_path_scheme(state_db: Path) -> str:
     """Return the path scheme stored in threads.rollout_path samples.
 
@@ -751,7 +763,7 @@ def _cluster_has_valid_anchor(mm: mmap.mmap, rstart: int, rend: int) -> bool:
         s = p + 1
     for sp in sample_starts:
         max_L = min(3000, rend - sp - SHA384_LEN)
-        for L in range(40, max_L):
+        for L in range(15, max_L):
             if hashlib.sha384(mm[sp : sp + L]).digest() == mm[sp + L : sp + L + SHA384_LEN]:
                 return True
     return False
@@ -828,10 +840,10 @@ def scan_binary_anchors(
 
             for sp in starts:
                 search_end = min(rend - SHA384_LEN, sp + MAX_MIGRATION_SQL_LEN)
-                if search_end <= sp + 40:
+                if search_end <= sp + 15:
                     continue
-                # Find boundaries in (sp+40, search_end] using binary search.
-                lo = bisect.bisect_left(boundaries, sp + 40)
+                # Find boundaries in (sp+15, search_end] using binary search.
+                lo = bisect.bisect_left(boundaries, sp + 15)
                 hi = bisect.bisect_right(boundaries, search_end)
                 tried = 0
                 matched = False
@@ -840,7 +852,7 @@ def scan_binary_anchors(
                     # the boundary character itself). Try a small set of offsets.
                     for offset in (0, 1, 2, 3):
                         L = bp - sp + offset
-                        if L < 40 or sp + L + SHA384_LEN > rend:
+                        if L < 15 or sp + L + SHA384_LEN > rend:
                             continue
                         tried += 1
                         sql_bytes = mm[sp : sp + L]
@@ -1677,8 +1689,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     con.section("Environment")
     con.info(f"CODEX_HOME = {codex_home}")
 
-    state_db = codex_home / STATE_DB_NAME
-    logs_db = codex_home / LOGS_DB_NAME
+    state_db, logs_db = resolve_db_paths(codex_home)
     missing_db = False
     for db in (state_db, logs_db):
         if not db.exists():
@@ -1846,8 +1857,7 @@ def cmd_fix_checksums(args: argparse.Namespace) -> int:
         return EXIT_NO_BINARY
 
     con.header(f"codex-repair v{SCRIPT_VERSION} :: fix-checksums")
-    state_db = codex_home / STATE_DB_NAME
-    logs_db = codex_home / LOGS_DB_NAME
+    state_db, logs_db = resolve_db_paths(codex_home)
 
     con.section("Scanning binary for expected checksums...")
     descriptions = _collect_all_descriptions(state_db, logs_db)
@@ -2012,7 +2022,7 @@ def _extract_first_user_message(jsonl: Path, max_lines: int = 200) -> Optional[s
 
 def cmd_manual_backfill(args: argparse.Namespace) -> int:
     codex_home = Path(args.codex_home).resolve()
-    state_db = codex_home / STATE_DB_NAME
+    state_db, _ = resolve_db_paths(codex_home)
 
     con.header(f"codex-repair v{SCRIPT_VERSION} :: manual-backfill")
     if not state_db.exists():
@@ -2294,9 +2304,8 @@ def cmd_extract_checksums(args: argparse.Namespace) -> int:
     con.header(f"codex-repair v{SCRIPT_VERSION} :: extract-checksums")
     con.info(f"binary = {binary}")
     # Use DB descriptions as locator if DBs exist; otherwise fallback algorithm runs.
-    descriptions = _collect_all_descriptions(
-        codex_home / STATE_DB_NAME, codex_home / LOGS_DB_NAME
-    )
+    state_db, logs_db = resolve_db_paths(codex_home)
+    descriptions = _collect_all_descriptions(state_db, logs_db)
     anchors = scan_binary_anchors(binary, descriptions_hint=descriptions)
     if args.json:
         out = [
