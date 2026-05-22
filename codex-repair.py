@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""codex-repair.py — Unified repair tool for Codex Desktop (Windows + WSL backend).
+# -*- coding: utf-8 -*-
+"""codex-repair.py — Unified repair tool for Codex Desktop (macOS, Windows, and WSL backend).
 
 Handles the two crash modes observed in Codex 0.130 -> 0.131 upgrade:
   1. sqlx migration checksum mismatch:
@@ -16,6 +17,11 @@ Subcommands:
   fix-checksums         Only fix migration checksum mismatch.
   manual-backfill       Only do manual thread metadata backfill.
   extract-checksums     Extract every expected migration checksum from binary.
+  db-health             Check SQLite DB health without needing a backend binary.
+  recover-state-db      Try sqlite3 .recover/.dump for state_5.sqlite.
+  reset-state-db        Move state_5.sqlite aside so Codex can recreate it.
+  quarantine-invalid-jsonl
+                        Move unindexable legacy JSONL files out of sessions/.
 
 Run `python codex-repair.py -h` or `python codex-repair.py <cmd> -h` for help.
 
@@ -40,8 +46,10 @@ import hashlib
 import json
 import mmap
 import os
+import platform
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -54,7 +62,7 @@ from typing import Iterable, Iterator, Optional
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.9"
 
 # The two state databases Codex 0.131 backend uses.
 STATE_DB_NAME = "state_5.sqlite"
@@ -139,7 +147,15 @@ class ChecksumDiff:
 
 @dataclasses.dataclass
 class BackfillStatus:
-    """Snapshot of `backfill_state` + thread/session counts."""
+    """Snapshot of `backfill_state` + thread/session counts.
+
+    `unindexed_files` contains only indexable rollout JSONL files: files whose
+    first line is a valid `session_meta` record with a session id. Older Codex
+    builds can leave `rollout-*.jsonl` files whose first line is not
+    `session_meta`; those cannot be inserted into `threads`, so they are tracked
+    separately in `ignored_unindexable_files` and do not make the backfill look
+    stuck by themselves.
+    """
 
     status: str
     last_watermark: Optional[str]
@@ -148,12 +164,14 @@ class BackfillStatus:
     sessions_jsonl_count: int
     archived_jsonl_count: int
     unindexed_files: list[Path]
+    ignored_unindexable_files: list[tuple[Path, str]]
 
     @property
     def is_stuck(self) -> bool:
-        # "Stuck" means we have unindexed files AND status isn't 'complete'.
-        # Even with status='complete', if there are unindexed files we should re-run.
-        return bool(self.unindexed_files) or self.status != "complete"
+        # Stuck means Codex says the backfill is incomplete OR there are valid
+        # session JSONL files that can still be inserted into `threads`.
+        # Non-session/legacy JSONL files are intentionally ignored here.
+        return self.status != "complete" or bool(self.unindexed_files)
 
 
 # ---------------------------------------------------------------------------
@@ -220,29 +238,253 @@ con = Console()  # global; reconfigured in main()
 # ---------------------------------------------------------------------------
 
 
+def host_target_triple() -> Optional[str]:
+    """Return the Rust/Codex target triple for the current host, if supported."""
+    machine = platform.machine().lower()
+    if machine in {"arm64", "aarch64"}:
+        arch = "aarch64"
+    elif machine in {"x86_64", "amd64"}:
+        arch = "x86_64"
+    else:
+        return None
+
+    if sys.platform == "darwin":
+        return f"{arch}-apple-darwin"
+    if sys.platform.startswith("linux"):
+        return f"{arch}-unknown-linux-musl"
+    if sys.platform.startswith("win"):
+        return f"{arch}-pc-windows-msvc"
+    return None
+
+
+def platform_package_for_triple(triple: str) -> Optional[str]:
+    """Return the npm optional-dependency package name for a Codex target triple."""
+    return {
+        "x86_64-unknown-linux-musl": "@openai/codex-linux-x64",
+        "aarch64-unknown-linux-musl": "@openai/codex-linux-arm64",
+        "x86_64-apple-darwin": "@openai/codex-darwin-x64",
+        "aarch64-apple-darwin": "@openai/codex-darwin-arm64",
+        "x86_64-pc-windows-msvc": "@openai/codex-win32-x64",
+        "aarch64-pc-windows-msvc": "@openai/codex-win32-arm64",
+    }.get(triple)
+
+
+def npm_package_path(base: Path, package_name: str) -> Path:
+    """Join an npm package name, including scoped packages, onto a base path."""
+    scope_and_name = package_name.split("/", 1)
+    if len(scope_and_name) == 2 and scope_and_name[0].startswith("@"):
+        return base / scope_and_name[0] / scope_and_name[1]
+    return base / package_name
+
+
+def _read_prefix(path: Path, n: int = 20_000) -> bytes:
+    try:
+        with path.open("rb") as f:
+            return f.read(n)
+    except OSError:
+        return b""
+
+
+def is_native_executable(path: Path) -> bool:
+    """Best-effort test for a native executable rather than a shell/Node wrapper."""
+    head = _read_prefix(path, 8)
+    native_magics = (
+        b"\xfe\xed\xfa\xce",  # Mach-O 32-bit BE
+        b"\xfe\xed\xfa\xcf",  # Mach-O 64-bit BE
+        b"\xce\xfa\xed\xfe",  # Mach-O 32-bit LE
+        b"\xcf\xfa\xed\xfe",  # Mach-O 64-bit LE
+        b"\xca\xfe\xba\xbe",  # Mach-O fat
+        b"\xbe\xba\xfe\xca",  # Mach-O fat reversed
+        b"\x7fELF",              # Linux / WSL
+        b"MZ",                    # Windows PE
+    )
+    return any(head.startswith(magic) for magic in native_magics)
+
+
+def looks_like_codex_node_wrapper(path: Path) -> bool:
+    """Return True if `path` appears to be Codex's JS/npm launcher."""
+    chunk = _read_prefix(path, 20_000)
+    if not chunk or b"\x00" in chunk[:512]:
+        return False
+    needles = (
+        b"@openai/codex-darwin-arm64",
+        b"@openai/codex-darwin-x64",
+        b"@openai/codex-linux-x64",
+        b"@openai/codex-linux-arm64",
+        b"@openai/codex-win32-x64",
+        b"PLATFORM_PACKAGE_BY_TARGET",
+        b"targetTriple",
+        b"vendorRoot",
+    )
+    if any(n in chunk for n in needles):
+        return True
+    # nvm/npm shims can be shell wrappers. Treat tiny text executables named
+    # codex as wrappers so they do not beat the native binary.
+    sample = chunk[:512]
+    printable = sum(32 <= b <= 126 or b in (9, 10, 13) for b in sample)
+    mostly_text = bool(sample) and printable / len(sample) > 0.90
+    lower = sample.lower()
+    return mostly_text and any(tok in lower for tok in (b"node", b"npm", b"/bin/sh", b"javascript"))
+
+
+def codex_package_root_from_wrapper(wrapper: Path) -> Optional[Path]:
+    """Infer the @openai/codex npm package root from a wrapper path."""
+    try:
+        p = wrapper.resolve()
+    except OSError:
+        p = wrapper
+
+    if p.parent.name == "bin" and p.parent.parent.name == "codex":
+        return p.parent.parent
+
+    parts = p.parts
+    for i in range(len(parts) - 1):
+        if parts[i] == "@openai" and parts[i + 1] == "codex":
+            return Path(*parts[: i + 2])
+    return None
+
+
+def native_candidates_from_npm_wrapper(wrapper: Path) -> list[Path]:
+    """Resolve Codex's npm/Node launcher to the platform native binary.
+
+    Current npm packages use a thin JS wrapper that spawns a Rust binary from
+    an optional platform package. On macOS these look like either:
+        @openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex
+    or the older layout:
+        @openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex/codex
+    """
+    triple = host_target_triple()
+    if not triple:
+        return []
+    pkg = platform_package_for_triple(triple)
+    if not pkg:
+        return []
+    binary_name = "codex.exe" if sys.platform.startswith("win") else "codex"
+    root = codex_package_root_from_wrapper(wrapper)
+    if not root:
+        return []
+
+    vendor_roots: list[Path] = []
+    vendor_roots.append(root / "vendor")
+    vendor_roots.append(npm_package_path(root / "node_modules", pkg) / "vendor")
+    if root.parent.name == "@openai":
+        vendor_roots.append(root.parent / pkg.split("/", 1)[1] / "vendor")
+    vendor_roots.append(npm_package_path(root.parent.parent, pkg) / "vendor")
+
+    out: list[Path] = []
+    for vendor_root in vendor_roots:
+        out.append(vendor_root / triple / "bin" / binary_name)
+        out.append(vendor_root / triple / "codex" / binary_name)
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for p in out:
+        try:
+            key = p.resolve() if p.exists() else p
+        except OSError:
+            key = p
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+    return unique
+
+
 def find_backend_binary(codex_home: Path) -> Optional[Path]:
-    """Return the newest WSL backend binary, or Windows fallback, or None."""
-    wsl_dir = codex_home / "bin" / "wsl"
-    candidates: list[tuple[float, Path]] = []
-    if wsl_dir.is_dir():
-        for sub in wsl_dir.iterdir():
-            cand = sub / "codex"
-            if cand.is_file():
-                candidates.append((cand.stat().st_mtime, cand))
-    win_cand = codex_home / "bin" / "codex.exe"
-    if win_cand.is_file():
-        candidates.append((win_cand.stat().st_mtime, win_cand))
+    """Return the best real Codex backend binary, or None.
+
+    The original script only checked Windows/WSL paths. On macOS, `which codex`
+    often points at a tiny npm/Node launcher such as:
+        .../.nvm/versions/node/.../bin/codex
+    That launcher is not the database-owning Rust backend and contains no sqlx
+    migration checksums. This detector resolves that launcher to Codex's native
+    optional-dependency binary first.
+    """
+    candidates: list[tuple[int, float, Path, str]] = []
+    seen: set[Path] = set()
+
+    def add_candidate(cand: Path, score: int, reason: str) -> None:
+        try:
+            if not cand.is_file():
+                return
+            resolved = cand.resolve()
+            if resolved in seen:
+                return
+            seen.add(resolved)
+            size = resolved.stat().st_size
+            if is_native_executable(resolved):
+                score += 1000
+                reason += "; native executable"
+            elif looks_like_codex_node_wrapper(resolved):
+                score -= 1500
+                reason += "; wrapper/launcher"
+            elif size < 128_000:
+                score -= 300
+                reason += f"; small ({size:,} bytes)"
+            else:
+                score += min(size // 1_000_000, 50)
+                reason += f"; size {size:,}"
+            candidates.append((score, resolved.stat().st_mtime, resolved, reason))
+        except OSError:
+            return
+
+    def add_path_and_resolved_native(path: Path, score: int, reason: str) -> None:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if looks_like_codex_node_wrapper(resolved):
+            for native in native_candidates_from_npm_wrapper(resolved):
+                add_candidate(native, score + 200, reason + "; resolved from npm wrapper")
+        add_candidate(path, score, reason)
+
+    # Codex Desktop / Windows+WSL local backend cache.
+    bin_dir = codex_home / "bin"
+    if bin_dir.is_dir():
+        for cand in bin_dir.rglob("*"):
+            if cand.name in {"codex", "codex.exe"} or cand.name.startswith("codex-"):
+                add_path_and_resolved_native(cand, 100, "CODEX_HOME/bin")
+
+    # macOS desktop app resources and Homebrew cask-style direct binaries.
+    for root in (
+        Path("/Applications/Codex.app/Contents/Resources"),
+        Path("/opt/homebrew/Caskroom/codex"),
+        Path("/usr/local/Caskroom/codex"),
+    ):
+        if root.is_dir():
+            for cand in root.rglob("codex*"):
+                if cand.name in {"codex", "codex.exe"} or cand.name.startswith("codex-"):
+                    add_path_and_resolved_native(cand, 80, str(root))
+
+    # Fallback: if Codex is on PATH, resolve the wrapper to the native binary.
+    path_cand = shutil.which("codex")
+    if path_cand:
+        add_path_and_resolved_native(Path(path_cand), 60, "PATH")
+
     if not candidates:
         return None
     candidates.sort(reverse=True)
-    return candidates[0][1]
-
+    for score, _mtime, path, reason in candidates:
+        con.debug(f"backend candidate score={score}: {path} ({reason})")
+    native_candidates = [c for c in candidates if is_native_executable(c[2])]
+    if native_candidates:
+        native_candidates.sort(reverse=True)
+        return native_candidates[0][2]
+    # Do not return a known wrapper just because it is the only thing on PATH.
+    if looks_like_codex_node_wrapper(candidates[0][2]):
+        return None
+    return candidates[0][2]
 
 def detect_rollout_path_scheme(state_db: Path) -> str:
-    """Return '/mnt/c/' or 'C:\\' based on existing threads.rollout_path samples.
+    """Return the path scheme stored in threads.rollout_path samples.
 
-    Defaults to '/mnt/c/' (WSL Linux backend) if table is empty.
+    Known values:
+      * '/mnt/c/' for WSL-style paths
+      * 'windows' for drive-letter paths like C:/...
+      * 'posix' for macOS/Linux paths like /Users/... or /home/...
+
+    If the table is empty, default to POSIX on non-Windows hosts and WSL-style
+    on native Windows, matching the old behavior for Windows users.
     """
+    fallback = "/mnt/c/" if os.name == "nt" else "posix"
     try:
         con_ro = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True, timeout=5)
         cur = con_ro.cursor()
@@ -250,24 +492,35 @@ def detect_rollout_path_scheme(state_db: Path) -> str:
         rows = cur.fetchall()
         con_ro.close()
     except sqlite3.Error:
-        return "/mnt/c/"
+        return fallback
     for (p,) in rows:
         if p and p.startswith("/mnt/"):
             return "/mnt/c/"
         if p and len(p) > 2 and p[1] == ":":
             return "windows"
-    return "/mnt/c/"
+        if p and p.startswith("/"):
+            return "posix"
+    return fallback
 
 
 def windows_path_to_rollout(win_path: Path, scheme: str) -> str:
-    """Convert a Windows filesystem path to the scheme stored in threads.rollout_path."""
+    """Convert a filesystem path to the scheme stored in threads.rollout_path."""
     p = str(win_path).replace("\\", "/")
     if scheme == "/mnt/c/":
         if len(p) > 1 and p[1] == ":":
             return "/mnt/" + p[0].lower() + p[2:]
         return p
-    # 'windows' scheme: keep as-is with forward slashes
+    # 'windows' and 'posix': keep the path as-is, normalized to forward slashes.
     return p
+
+
+def path_is_relative_to(path: Path, parent: Path) -> bool:
+    """Compatibility helper for Python 3.7/3.8, before Path.is_relative_to()."""
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -970,12 +1223,38 @@ def compute_checksum_diffs(
 # ---------------------------------------------------------------------------
 
 
-def collect_backfill_status(codex_home: Path, state_db: Path) -> BackfillStatus:
-    bf = read_backfill_state(state_db) or ("unknown", None, None)
-    indexed = read_indexed_rollout_paths(state_db)
-    threads_count = read_threads_count(state_db)
-    scheme = detect_rollout_path_scheme(state_db)
+def classify_session_jsonl(jsonl: Path) -> tuple[bool, str]:
+    """Return (is_indexable_session_rollout, reason).
 
+    Codex thread backfill can only index rollout files whose first line is a
+    `session_meta` JSON object with a payload id. Some legacy or partial
+    `rollout-*.jsonl` files contain event records first; those should not keep
+    doctor in a permanent "backfill stuck" state.
+    """
+    try:
+        with jsonl.open("r", encoding="utf-8") as f:
+            first_line = f.readline()
+    except OSError as exc:
+        return (False, f"could not read: {exc}")
+    if not first_line.strip():
+        return (False, "empty file")
+    try:
+        meta = json.loads(first_line)
+    except json.JSONDecodeError as exc:
+        return (False, f"first line invalid JSON: {exc.msg}")
+    if not isinstance(meta, dict):
+        return (False, "first line JSON is not an object")
+    if meta.get("type") != "session_meta":
+        return (False, "first line not session_meta")
+    payload = meta.get("payload", {}) or {}
+    if not isinstance(payload, dict):
+        return (False, "session_meta payload is not an object")
+    if not payload.get("id"):
+        return (False, "session_meta missing id")
+    return (True, "session_meta ok")
+
+
+def collect_jsonl_files(codex_home: Path) -> tuple[list[Path], Path, Path]:
     sessions_dir = codex_home / "sessions"
     archived_dir = codex_home / "archived_sessions"
     all_files: list[Path] = []
@@ -983,25 +1262,44 @@ def collect_backfill_status(codex_home: Path, state_db: Path) -> BackfillStatus:
         all_files.extend(p for p in sessions_dir.rglob("*.jsonl"))
     if archived_dir.is_dir():
         all_files.extend(p for p in archived_dir.rglob("*.jsonl"))
+    return (all_files, sessions_dir, archived_dir)
+
+
+def collect_backfill_status(codex_home: Path, state_db: Path) -> BackfillStatus:
+    bf = read_backfill_state(state_db) or ("unknown", None, None)
+    indexed = read_indexed_rollout_paths(state_db)
+    threads_count = read_threads_count(state_db)
+    scheme = detect_rollout_path_scheme(state_db)
+
+    all_files, sessions_dir, _archived_dir = collect_jsonl_files(codex_home)
 
     unindexed: list[Path] = []
+    ignored_unindexable: list[tuple[Path, str]] = []
     for fp in all_files:
         rp = windows_path_to_rollout(fp, scheme)
-        if rp not in indexed:
+        if rp in indexed:
+            continue
+        is_indexable, reason = classify_session_jsonl(fp)
+        if is_indexable:
             unindexed.append(fp)
+        else:
+            ignored_unindexable.append((fp, reason))
+
+    session_count = (
+        sum(1 for p in all_files if path_is_relative_to(p, sessions_dir))
+        if sessions_dir.is_dir()
+        else 0
+    )
 
     return BackfillStatus(
         status=bf[0],
         last_watermark=bf[1],
         last_success_at=bf[2],
         indexed_threads=threads_count,
-        sessions_jsonl_count=sum(1 for p in all_files if p.is_relative_to(sessions_dir))
-        if sessions_dir.is_dir()
-        else 0,
-        archived_jsonl_count=len(all_files) - (
-            sum(1 for p in all_files if p.is_relative_to(sessions_dir)) if sessions_dir.is_dir() else 0
-        ),
+        sessions_jsonl_count=session_count,
+        archived_jsonl_count=len(all_files) - session_count,
         unindexed_files=unindexed,
+        ignored_unindexable_files=ignored_unindexable,
     )
 
 
@@ -1034,6 +1332,337 @@ def isolate_copy(db: Path, dest_dir: Path) -> Path:
     return new_main
 
 
+
+# ---------------------------------------------------------------------------
+# SQLite health / recovery helpers
+# ---------------------------------------------------------------------------
+
+
+def sqlite_check(db: Path, full: bool = False) -> tuple[bool, str]:
+    """Run SQLite quick_check/integrity_check against a DB opened read-only."""
+    pragma = "integrity_check" if full else "quick_check"
+    try:
+        with sqlite_ro(db) as cn:
+            cur = cn.cursor()
+            cur.execute(f"PRAGMA {pragma}")
+            rows = [str(r[0]) for r in cur.fetchall()]
+    except sqlite3.Error as exc:
+        return (False, str(exc))
+    except OSError as exc:
+        return (False, str(exc))
+    if rows == ["ok"]:
+        return (True, "ok")
+    if not rows:
+        return (False, "no result returned")
+    suffix = "" if len(rows) <= 8 else f"; ... {len(rows)-8} more"
+    return (False, "; ".join(rows[:8]) + suffix)
+
+
+def _state_db_sidecars(state_db: Path) -> list[Path]:
+    return [state_db, state_db.with_name(state_db.name + "-wal"), state_db.with_name(state_db.name + "-shm")]
+
+
+def _timestamped_repair_dir(codex_home: Path, prefix: str) -> Path:
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    d = codex_home / f"{prefix}-{ts}"
+    d.mkdir(parents=True, exist_ok=False)
+    return d
+
+
+def _copy_existing(paths: Iterable[Path], dest: Path) -> None:
+    for p in paths:
+        if p.exists():
+            shutil.copy2(p, dest / p.name)
+
+
+def _move_existing(paths: Iterable[Path], dest: Path, suffix: str = ".original") -> None:
+    for p in paths:
+        if p.exists():
+            shutil.move(str(p), str(dest / (p.name + suffix)))
+
+
+def _sqlite3_candidates(preferred: Optional[str] = None) -> list[Path]:
+    """Return sqlite3 shell candidates, preferring modern/Homebrew builds.
+
+    macOS's /usr/bin/sqlite3 can be old enough to lack the `.recover` command.
+    Homebrew/MacPorts builds usually include it, so we look there first while
+    still accepting an explicit --sqlite3 or SQLITE3=... override.
+    """
+    raw: list[Path] = []
+    if preferred:
+        raw.append(Path(preferred).expanduser())
+    env_sqlite3 = os.environ.get("SQLITE3")
+    if env_sqlite3:
+        raw.append(Path(env_sqlite3).expanduser())
+    for p in (
+        "/opt/homebrew/opt/sqlite/bin/sqlite3",
+        "/usr/local/opt/sqlite/bin/sqlite3",
+        "/opt/local/bin/sqlite3",
+    ):
+        raw.append(Path(p))
+    which = shutil.which("sqlite3")
+    if which:
+        raw.append(Path(which))
+    raw.append(Path("/usr/bin/sqlite3"))
+
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for p in raw:
+        try:
+            if not p.is_file():
+                continue
+            key = p.resolve()
+        except OSError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _sqlite3_version(sqlite3_bin: Path) -> str:
+    try:
+        p = subprocess.run(
+            [str(sqlite3_bin), "-version"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        return (p.stdout or p.stderr or "unknown").strip().splitlines()[0]
+    except Exception as exc:
+        return f"unknown ({exc})"
+
+
+def _sqlite3_supports_recover(sqlite3_bin: Path) -> bool:
+    """Best-effort check whether this sqlite3 shell supports `.recover`."""
+    try:
+        help_run = subprocess.run(
+            [str(sqlite3_bin), "-batch", ":memory:", ".help recover"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        combined = (help_run.stdout + "\n" + help_run.stderr).lower()
+        if ".recover" in combined and "unknown" not in combined:
+            return True
+
+        probe = subprocess.run(
+            [str(sqlite3_bin), "-batch", ":memory:", ".recover"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        combined = (probe.stdout + "\n" + probe.stderr).lower()
+        if "unknown command" in combined or "invalid arguments" in combined:
+            return False
+        return probe.returncode == 0 or "begin" in combined or "pragma" in combined
+    except Exception:
+        return False
+
+
+def _load_recovery_sql(sqlite3_bin: Path, recovered_db: Path, sql_text: str, tag: str) -> tuple[bool, str]:
+    load = subprocess.run(
+        [str(sqlite3_bin), "-batch", str(recovered_db)],
+        input=sql_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    (recovered_db.with_suffix(recovered_db.suffix + f".{tag}.load.stdout.txt")).write_text(
+        load.stdout, encoding="utf-8", errors="replace"
+    )
+    (recovered_db.with_suffix(recovered_db.suffix + f".{tag}.load.stderr.txt")).write_text(
+        load.stderr, encoding="utf-8", errors="replace"
+    )
+    if load.returncode != 0:
+        return (False, f"loading {tag} SQL failed: {load.stderr.strip()[:500]}")
+
+    ok, msg = sqlite_check(recovered_db, full=False)
+    if not ok:
+        return (False, f"{tag} DB failed quick_check: {msg}")
+    return (True, "ok")
+
+
+def _run_sqlite_recover(sqlite3_bin: Path, source_db: Path, recovered_db: Path, sql_file: Path) -> tuple[bool, str]:
+    """Run `sqlite3 source .recover | sqlite3 recovered` and verify quick_check."""
+    recover = subprocess.run(
+        [str(sqlite3_bin), "-batch", str(source_db), ".recover"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    sql_file.write_text(recover.stdout, encoding="utf-8", errors="replace")
+    (sql_file.with_suffix(sql_file.suffix + ".stderr.txt")).write_text(
+        recover.stderr, encoding="utf-8", errors="replace"
+    )
+    err_lower = recover.stderr.lower()
+    if "unknown command" in err_lower or "invalid arguments" in err_lower:
+        return (False, f"{sqlite3_bin} does not support .recover: {recover.stderr.strip()[:500]}")
+    if not recover.stdout.strip():
+        return (False, f"sqlite3 .recover produced no SQL; stderr: {recover.stderr.strip()[:500]}")
+
+    return _load_recovery_sql(sqlite3_bin, recovered_db, recover.stdout, "recover")
+
+
+def _run_sqlite_dump_salvage(sqlite3_bin: Path, source_db: Path, recovered_db: Path, sql_file: Path) -> tuple[bool, str]:
+    """Fallback for sqlite shells without `.recover`: try `.dump` and verify.
+
+    `.dump` is less powerful than `.recover`; it can fail if the damaged pages
+    are needed to read a table. It is still worth trying before resetting the
+    state database because many `quick_check` failures are in pages that do not
+    prevent a normal schema/data dump.
+    """
+    dump = subprocess.run(
+        [str(sqlite3_bin), "-batch", str(source_db), ".dump"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    sql_file.write_text(dump.stdout, encoding="utf-8", errors="replace")
+    (sql_file.with_suffix(sql_file.suffix + ".stderr.txt")).write_text(
+        dump.stderr, encoding="utf-8", errors="replace"
+    )
+    if not dump.stdout.strip():
+        return (False, f"sqlite3 .dump produced no SQL; stderr: {dump.stderr.strip()[:500]}")
+    if "ROLLBACK; -- due to errors" in dump.stdout:
+        return (False, f"sqlite3 .dump hit corruption before completion; stderr: {dump.stderr.strip()[:500]}")
+
+    return _load_recovery_sql(sqlite3_bin, recovered_db, dump.stdout, "dump")
+
+
+def cmd_db_health(args: argparse.Namespace) -> int:
+    codex_home = Path(args.codex_home).resolve()
+    con.header(f"codex-repair v{SCRIPT_VERSION} :: db-health")
+    con.info(f"CODEX_HOME = {codex_home}")
+    rc = EXIT_HEALTHY
+    for name in (STATE_DB_NAME, LOGS_DB_NAME):
+        db = codex_home / name
+        con.section(name)
+        if not db.exists():
+            con.err(f"missing database: {db}")
+            rc = EXIT_NO_DB
+            continue
+        con.info(f"path = {db}")
+        con.info(f"size = {db.stat().st_size:,} bytes")
+        for side in (db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")):
+            if side.exists():
+                con.info(f"sidecar = {side.name} ({side.stat().st_size:,} bytes)")
+        ok, msg = sqlite_check(db, full=getattr(args, "full", False))
+        if ok:
+            con.ok(("integrity_check" if getattr(args, "full", False) else "quick_check") + " = ok")
+        else:
+            con.err(("integrity_check" if getattr(args, "full", False) else "quick_check") + f" failed: {msg}")
+            rc = EXIT_ERROR
+    return rc
+
+
+def cmd_recover_state_db(args: argparse.Namespace) -> int:
+    codex_home = Path(args.codex_home).resolve()
+    state_db = codex_home / STATE_DB_NAME
+    con.header(f"codex-repair v{SCRIPT_VERSION} :: recover-state-db")
+    con.info("Close Codex before using --apply. This command never touches session JSONL files.")
+    if not state_db.exists():
+        con.err(f"missing {state_db}")
+        return EXIT_NO_DB
+
+    sqlite3_bins = _sqlite3_candidates(getattr(args, "sqlite3", None))
+    if not sqlite3_bins:
+        con.err("sqlite3 command-line tool not found")
+        con.info("fallback reset: python3 codex-repair.py reset-state-db --apply")
+        return EXIT_ERROR
+
+    repair_dir = _timestamped_repair_dir(codex_home, "state_5-recover" if args.apply else "state_5-recover-dryrun")
+    con.info(f"repair directory = {repair_dir}")
+    _copy_existing(_state_db_sidecars(state_db), repair_dir)
+    con.ok("copied current state DB and sidecars into repair directory")
+
+    con.section("sqlite3 candidates")
+    recover_capable: list[Path] = []
+    for bin_path in sqlite3_bins:
+        version = _sqlite3_version(bin_path)
+        supports = _sqlite3_supports_recover(bin_path)
+        con.info(f"{bin_path} :: {version} :: .recover={'yes' if supports else 'no'}")
+        if supports:
+            recover_capable.append(bin_path)
+
+    recovered_db: Optional[Path] = None
+    success_msg: Optional[str] = None
+
+    if recover_capable:
+        con.section("Trying sqlite3 .recover")
+        for i, bin_path in enumerate(recover_capable, start=1):
+            candidate_db = repair_dir / f"state_5.recovered.recover-{i}.sqlite"
+            sql_file = repair_dir / f"state_5.recover-{i}.sql"
+            ok, msg = _run_sqlite_recover(bin_path, state_db, candidate_db, sql_file)
+            if ok:
+                recovered_db = candidate_db
+                success_msg = f".recover succeeded using {bin_path}"
+                break
+            con.warn(f".recover using {bin_path} failed: {msg}")
+    else:
+        con.warn("none of the detected sqlite3 shells support .recover")
+
+    if recovered_db is None:
+        con.section("Trying sqlite3 .dump fallback")
+        for i, bin_path in enumerate(sqlite3_bins, start=1):
+            candidate_db = repair_dir / f"state_5.recovered.dump-{i}.sqlite"
+            sql_file = repair_dir / f"state_5.dump-{i}.sql"
+            ok, msg = _run_sqlite_dump_salvage(bin_path, state_db, candidate_db, sql_file)
+            if ok:
+                recovered_db = candidate_db
+                success_msg = f".dump fallback succeeded using {bin_path}"
+                break
+            con.warn(f".dump using {bin_path} failed: {msg}")
+
+    if recovered_db is None:
+        con.err("could not create a healthy recovered state_5.sqlite")
+        con.info(f"recovery SQL/logs are in {repair_dir}")
+        con.info("next safe fallback: python3 codex-repair.py reset-state-db --apply")
+        con.info("optional: install a modern SQLite shell, then rerun recovery; e.g. `brew install sqlite`")
+        return EXIT_ERROR
+
+    con.ok(f"{success_msg}; recovered DB quick_check = ok ({recovered_db})")
+
+    if not args.apply:
+        con.warn("dry-run only — original state_5.sqlite was not replaced")
+        con.info("to replace it with the recovered copy, rerun with: recover-state-db --apply")
+        return EXIT_HEALTHY
+
+    # Move the current DB aside and install the recovered copy.
+    _move_existing(_state_db_sidecars(state_db), repair_dir, suffix=".replaced")
+    shutil.copy2(recovered_db, state_db)
+    con.ok(f"installed recovered DB as {state_db}")
+    con.info(f"the previous DB and sidecars were moved to {repair_dir}")
+    return EXIT_HEALTHY
+
+
+def cmd_reset_state_db(args: argparse.Namespace) -> int:
+    codex_home = Path(args.codex_home).resolve()
+    state_db = codex_home / STATE_DB_NAME
+    con.header(f"codex-repair v{SCRIPT_VERSION} :: reset-state-db")
+    con.warn("This moves state_5.sqlite aside so Codex can recreate it on next launch.")
+    con.info("It does not delete ~/.codex/sessions or ~/.codex/archived_sessions JSONL files.")
+    existing = [p for p in _state_db_sidecars(state_db) if p.exists()]
+    if not existing:
+        con.ok("no state_5.sqlite files exist; nothing to reset")
+        return EXIT_HEALTHY
+    repair_dir = codex_home / f"state_5-reset-{time.strftime('%Y%m%d-%H%M%S')}"
+    if not args.apply:
+        con.info(f"would create {repair_dir}")
+        for p in existing:
+            con.info(f"would move {p.name} -> {repair_dir}/{p.name}.reset")
+        con.warn("dry-run only — pass --apply to actually move the DB aside")
+        return EXIT_HEALTHY
+    repair_dir.mkdir(parents=True, exist_ok=False)
+    _move_existing(existing, repair_dir, suffix=".reset")
+    con.ok(f"moved {len(existing)} file(s) into {repair_dir}")
+    con.info("Now launch Codex once so it recreates state_5.sqlite, then quit Codex and rerun doctor/manual-backfill if needed.")
+    return EXIT_HEALTHY
+
 # ---------------------------------------------------------------------------
 # Subcommand: doctor
 # ---------------------------------------------------------------------------
@@ -1041,26 +1670,24 @@ def isolate_copy(db: Path, dest_dir: Path) -> Path:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     codex_home = Path(args.codex_home).resolve()
-    binary = Path(args.binary).resolve() if args.binary else find_backend_binary(codex_home)
+    explicit_binary = Path(args.binary).expanduser().resolve() if args.binary else None
+    binary = explicit_binary if explicit_binary else find_backend_binary(codex_home)
 
     con.header(f"codex-repair v{SCRIPT_VERSION} :: doctor")
     con.section("Environment")
     con.info(f"CODEX_HOME = {codex_home}")
-    if binary:
-        con.info(f"backend    = {binary}")
-        st = binary.stat()
-        con.info(f"             ({st.st_size:,} bytes, modified {time.ctime(st.st_mtime)})")
-    else:
-        con.err("no backend binary found — cannot extract expected checksums")
-        return EXIT_NO_BINARY
 
     state_db = codex_home / STATE_DB_NAME
     logs_db = codex_home / LOGS_DB_NAME
+    missing_db = False
     for db in (state_db, logs_db):
         if not db.exists():
             con.err(f"missing database: {db}")
-            return EXIT_NO_DB
-        con.info(f"db         = {db.name} ({db.stat().st_size:,} bytes)")
+            missing_db = True
+        else:
+            con.info(f"db         = {db.name} ({db.stat().st_size:,} bytes)")
+    if missing_db:
+        return EXIT_NO_DB
 
     # If using isolated copies for safety, copy them now.
     if args.use_isolated_copy:
@@ -1068,67 +1695,131 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         con.section(f"Isolated copy mode → {cache}")
         state_db = isolate_copy(state_db, cache)
         logs_db = isolate_copy(logs_db, cache)
-        con.ok(f"copied DBs to isolated location; original DB is untouched")
+        con.ok("copied DBs to isolated location; original DB is untouched")
 
-    con.section("Scanning binary for migration anchors")
-    t0 = time.time()
-    descriptions = _collect_all_descriptions(state_db, logs_db)
-    con.debug(f"  using {len(descriptions)} known descriptions as locators")
-    anchors = scan_binary_anchors(binary, descriptions_hint=descriptions)
-    con.ok(f"found {len(anchors)} (sql, sha384) anchors in {time.time()-t0:.1f}s")
+    con.section("SQLite health")
+    db_malformed = False
+    for db in (state_db, logs_db):
+        ok, msg = sqlite_check(db, full=False)
+        if ok:
+            con.ok(f"{db.name}: quick_check ok")
+        else:
+            con.err(f"{db.name}: quick_check failed: {msg}")
+            db_malformed = True
+
+    binary_ok = False
+    anchors: list[BinaryAnchor] = []
+    if binary:
+        con.section("Backend binary")
+        con.info(f"backend    = {binary}")
+        st = binary.stat()
+        con.info(f"             ({st.st_size:,} bytes, modified {time.ctime(st.st_mtime)})")
+        if not is_native_executable(binary):
+            con.err("selected backend is not a native executable")
+            con.warn("it looks like a Node/npm launcher; checksum scanning would be meaningless")
+        elif not db_malformed:
+            con.section("Scanning binary for migration anchors")
+            t0 = time.time()
+            descriptions = _collect_all_descriptions(state_db, logs_db)
+            con.debug(f"  using {len(descriptions)} known descriptions as locators")
+            anchors = scan_binary_anchors(binary, descriptions_hint=descriptions)
+            con.ok(f"found {len(anchors)} (sql, sha384) anchors in {time.time()-t0:.1f}s")
+            if anchors:
+                binary_ok = True
+            else:
+                con.err("no migration anchors found in selected backend")
+                con.warn("this usually means the selected file is a launcher/wrapper, not the native Rust Codex binary")
+        else:
+            con.warn("skipping binary checksum scan because a DB failed quick_check")
+    else:
+        con.section("Backend binary")
+        con.warn("no native backend binary found — checksum drift checks will be skipped")
 
     overall_exit = EXIT_HEALTHY
-    all_diffs: list[ChecksumDiff] = []
-    for db in (state_db, logs_db):
-        con.section(f"Checksum drift check :: {db.name}")
-        diffs = compute_checksum_diffs(db, binary, anchors)
-        if not diffs:
-            con.ok("all migration checksums match binary")
-            continue
-        for d in diffs:
-            con.err(
-                f"m{d.db_row.version} {d.db_row.description!r}: DB cksum "
-                f"{d.db_row.checksum_hex[:16]}... ≠ binary"
-            )
-            if d.binary_anchor:
-                con.info(f"  binary expects: {d.binary_anchor.checksum_hex[:16]}...")
-                con.info(f"  binary SQL    : {d.binary_anchor.sql_first_line[:100]}")
-            for note in d.schema_notes:
-                con.info(f"  schema check  : {note}")
-            if d.schema_ok:
-                con.ok("  → SAFE to rewrite checksum (schema is compatible)")
-            else:
-                con.warn("  → UNSAFE: schema does not match; needs real migration run")
-        all_diffs.extend(diffs)
-        if any(diffs):
-            overall_exit = EXIT_CHECKSUM_DRIFT
+    if db_malformed:
+        con.section("Checksum drift check")
+        con.warn("skipped because at least one database failed SQLite quick_check")
+    elif binary_ok:
+        all_diffs: list[ChecksumDiff] = []
+        for db in (state_db, logs_db):
+            con.section(f"Checksum drift check :: {db.name}")
+            diffs = compute_checksum_diffs(db, binary, anchors)
+            if not diffs:
+                con.ok("all migration checksums match binary")
+                continue
+            for d in diffs:
+                con.err(
+                    f"m{d.db_row.version} {d.db_row.description!r}: DB cksum "
+                    f"{d.db_row.checksum_hex[:16]}... ≠ binary"
+                )
+                if d.binary_anchor:
+                    con.info(f"  binary expects: {d.binary_anchor.checksum_hex[:16]}...")
+                    con.info(f"  binary SQL    : {d.binary_anchor.sql_first_line[:100]}")
+                for note in d.schema_notes:
+                    con.info(f"  schema check  : {note}")
+                if d.schema_ok:
+                    con.ok("  → SAFE to rewrite checksum (schema is compatible)")
+                else:
+                    con.warn("  → UNSAFE: schema does not match; needs real migration run")
+            all_diffs.extend(diffs)
+            if any(diffs):
+                overall_exit = EXIT_CHECKSUM_DRIFT
+    else:
+        con.section("Checksum drift check")
+        con.warn("skipped because no usable native backend binary was found")
+        overall_exit = EXIT_NO_BINARY
 
     con.section("Backfill state")
-    try:
-        bf = collect_backfill_status(codex_home, state_db)
-    except sqlite3.Error as exc:
-        con.err(f"could not read backfill_state: {exc}")
-        bf = None
+    db_read_error: Optional[sqlite3.Error] = None
+    bf: Optional[BackfillStatus] = None
+    if db_malformed:
+        con.warn("skipped because state_5.sqlite failed quick_check")
+    else:
+        try:
+            bf = collect_backfill_status(codex_home, state_db)
+        except sqlite3.Error as exc:
+            con.err(f"could not read backfill_state: {exc}")
+            con.warn("state_5.sqlite could be corrupt or being read while Codex is mutating it")
+            db_read_error = exc
     if bf:
         con.info(f"status              = {bf.status}")
         con.info(f"last_watermark      = {bf.last_watermark}")
         con.info(f"indexed threads     = {bf.indexed_threads}")
         con.info(f"sessions jsonl      = {bf.sessions_jsonl_count}")
         con.info(f"archived jsonl      = {bf.archived_jsonl_count}")
-        con.info(f"unindexed files     = {len(bf.unindexed_files)}")
+        con.info(f"unindexed indexable = {len(bf.unindexed_files)}")
+        con.info(f"ignored unindexable = {len(bf.ignored_unindexable_files)}")
+        if bf.ignored_unindexable_files:
+            for p, reason in bf.ignored_unindexable_files[:5]:
+                con.info(f"  ignored {p.name}: {reason}")
+            if len(bf.ignored_unindexable_files) > 5:
+                con.info(f"  ... {len(bf.ignored_unindexable_files) - 5} more ignored")
         if bf.is_stuck:
-            con.warn("backfill appears stuck (unindexed files exist or status != complete)")
+            con.warn("backfill appears stuck (status incomplete or valid unindexed session files exist)")
             con.warn("→ on next Codex launch, 30s startup timeout may fire")
             if overall_exit == EXIT_HEALTHY:
                 overall_exit = EXIT_BACKFILL_STUCK
             elif overall_exit == EXIT_CHECKSUM_DRIFT:
                 overall_exit = EXIT_BOTH
         else:
-            con.ok("backfill complete, no unindexed files")
+            if bf.ignored_unindexable_files:
+                con.ok("backfill complete; remaining unindexed JSONL files are non-session/legacy files")
+            else:
+                con.ok("backfill complete, no unindexed files")
 
     con.section("Summary")
+    if db_malformed or db_read_error is not None:
+        con.warn("detected: database read error / possible SQLite corruption")
+        con.info("do not run `fix --apply` until this is resolved")
+        con.info("recommended: python codex-repair.py db-health")
+        con.info("try recovery: python3 codex-repair.py recover-state-db --apply")
+        con.info("fallback reset: python3 codex-repair.py reset-state-db --apply")
+        return EXIT_ERROR
     if overall_exit == EXIT_HEALTHY:
         con.ok("install is healthy — no action needed")
+    elif overall_exit == EXIT_NO_BINARY:
+        con.warn("detected: no usable native backend binary, so checksum checks were skipped")
+        con.info("database health/backfill checks above are still valid")
     else:
         names = {
             EXIT_CHECKSUM_DRIFT: "migration checksum drift",
@@ -1162,6 +1853,10 @@ def cmd_fix_checksums(args: argparse.Namespace) -> int:
     descriptions = _collect_all_descriptions(state_db, logs_db)
     anchors = scan_binary_anchors(binary, descriptions_hint=descriptions)
     con.ok(f"found {len(anchors)} anchors")
+    if not anchors:
+        con.err("no migration anchors found in selected backend")
+        con.warn("refusing to compare or rewrite checksums against a launcher/wrapper")
+        return EXIT_NO_BINARY
 
     operate_on_state = state_db
     operate_on_logs = logs_db
@@ -1415,7 +2110,7 @@ def cmd_manual_backfill(args: argparse.Namespace) -> int:
             first_msg_db = _truncate(first_msg, 1000)
             is_archived = (
                 archived_root is not None
-                and win_path.resolve().is_relative_to(archived_root)
+                and path_is_relative_to(win_path, archived_root)
             )
 
             row = {
@@ -1463,6 +2158,8 @@ def cmd_manual_backfill(args: argparse.Namespace) -> int:
             con.info(f"  {p.name}: {r}")
         if len(skipped) > 10:
             con.info(f"  ... {len(skipped)-10} more")
+        if not planned_inserts:
+            con.ok("no indexable unindexed session files remain; skipped files are non-session/legacy JSONL")
 
     if not args.apply:
         for row in planned_inserts[:3]:
@@ -1510,6 +2207,75 @@ def cmd_manual_backfill(args: argparse.Namespace) -> int:
     con.ok(f"inserted {inserted} new thread row(s)")
     final_count = read_threads_count(state_db)
     con.ok(f"threads table now has {final_count} rows")
+    return EXIT_HEALTHY
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: quarantine-invalid-jsonl
+# ---------------------------------------------------------------------------
+
+
+def cmd_quarantine_invalid_jsonl(args: argparse.Namespace) -> int:
+    """Move unindexed, non-session JSONL files out of sessions/.
+
+    This only moves files that are not already referenced by `threads.rollout_path`
+    and that cannot be indexed because the first line is not a usable
+    `session_meta` record. It never deletes files.
+    """
+    codex_home = Path(args.codex_home).resolve()
+    state_db = codex_home / STATE_DB_NAME
+    con.header(f"codex-repair v{SCRIPT_VERSION} :: quarantine-invalid-jsonl")
+    if not state_db.exists():
+        con.err(f"missing {state_db}")
+        return EXIT_NO_DB
+
+    health = sqlite_quick_check(state_db)
+    if health != "ok":
+        con.err(f"state_5.sqlite quick_check failed: {health}")
+        con.warn("not moving JSONL files while the state DB is unhealthy")
+        return EXIT_ERROR
+
+    indexed = read_indexed_rollout_paths(state_db)
+    scheme = detect_rollout_path_scheme(state_db)
+    all_files, _sessions_dir, _archived_dir = collect_jsonl_files(codex_home)
+
+    candidates: list[tuple[Path, str]] = []
+    for fp in all_files:
+        rp = windows_path_to_rollout(fp, scheme)
+        if rp in indexed:
+            continue
+        is_indexable, reason = classify_session_jsonl(fp)
+        if not is_indexable:
+            candidates.append((fp, reason))
+
+    con.info(f"unindexed non-session/legacy JSONL files = {len(candidates)}")
+    if not candidates:
+        con.ok("nothing to quarantine")
+        return EXIT_HEALTHY
+
+    for p, reason in candidates[:10]:
+        display = p.relative_to(codex_home) if path_is_relative_to(p, codex_home) else p
+        con.info(f"  {display}: {reason}")
+    if len(candidates) > 10:
+        con.info(f"  ... {len(candidates)-10} more")
+
+    if not args.apply:
+        con.warn("dry-run only — pass --apply to move these files to a quarantine directory")
+        return EXIT_HEALTHY
+
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    quarantine_dir = codex_home / f"invalid-jsonl-quarantine-{ts}"
+    manifest: list[dict[str, str]] = []
+    for src, reason in candidates:
+        rel = src.relative_to(codex_home) if path_is_relative_to(src, codex_home) else Path(src.name)
+        dest = quarantine_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dest))
+        manifest.append({"from": str(src), "to": str(dest), "reason": reason})
+    manifest_path = quarantine_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    con.ok(f"moved {len(candidates)} file(s) to {quarantine_dir}")
+    con.ok(f"wrote manifest: {manifest_path}")
     return EXIT_HEALTHY
 
 
@@ -1563,7 +2329,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
     if rc == EXIT_HEALTHY:
         con.ok("doctor says healthy — nothing to fix")
         return EXIT_HEALTHY
-    if rc in (EXIT_NO_BINARY, EXIT_NO_DB):
+    if rc not in (EXIT_CHECKSUM_DRIFT, EXIT_BACKFILL_STUCK, EXIT_BOTH):
         return rc
 
     # 2) fix checksums if needed
@@ -1600,7 +2366,7 @@ def _add_global_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--binary",
         default=None,
-        help="Backend binary path (default: auto-detect newest in {codex-home}/bin/wsl/*/codex)",
+        help="Backend binary path (default: auto-detect native Codex backend, including npm macOS wrappers)",
     )
     p.add_argument(
         "--apply",
@@ -1612,13 +2378,18 @@ def _add_global_flags(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Copy DBs to a temp dir and operate on copies (zero risk to running Codex; implies dry-run)",
     )
+    p.add_argument(
+        "--sqlite3",
+        default=None,
+        help="sqlite3 shell to use for recover-state-db (default: auto-detect Homebrew/MacPorts/PATH)",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="codex-repair",
-        description="Unified repair tool for Codex Desktop (Windows + WSL backend).",
+        description="Unified repair tool for Codex Desktop (macOS, Windows, and WSL backend).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -1635,9 +2406,15 @@ def build_parser() -> argparse.ArgumentParser:
         ("fix", "Auto-detect and fix all issues (dry-run unless --apply)"),
         ("fix-checksums", "Only fix migration checksum drift"),
         ("manual-backfill", "Only do manual thread metadata backfill"),
+        ("quarantine-invalid-jsonl", "Move unindexed non-session JSONL files out of sessions/"),
+        ("recover-state-db", "Try SQLite .recover/.dump for state_5.sqlite (dry-run unless --apply)"),
+        ("reset-state-db", "Move state_5.sqlite aside so Codex can recreate it (dry-run unless --apply)"),
     ):
         sp = sub.add_parser(name, help=help_text)
         _add_global_flags(sp)
+    dbh = sub.add_parser("db-health", help="Check SQLite DB health without needing a backend binary")
+    _add_global_flags(dbh)
+    dbh.add_argument("--full", action="store_true", help="run PRAGMA integrity_check instead of quick_check (slower)")
     extract = sub.add_parser("extract-checksums", help="List all migration checksums from binary")
     _add_global_flags(extract)
     extract.add_argument("--json", action="store_true", help="output JSON")
@@ -1656,6 +2433,7 @@ def _merge_global_args(args: argparse.Namespace, parser: argparse.ArgumentParser
         ("binary", None),
         ("apply", False),
         ("use_isolated_copy", False),
+        ("sqlite3", None),
         ("verbose", False),
     ):
         if not hasattr(args, attr):
@@ -1683,6 +2461,10 @@ def main() -> int:
         "fix": cmd_fix,
         "fix-checksums": cmd_fix_checksums,
         "manual-backfill": cmd_manual_backfill,
+        "quarantine-invalid-jsonl": cmd_quarantine_invalid_jsonl,
+        "db-health": cmd_db_health,
+        "recover-state-db": cmd_recover_state_db,
+        "reset-state-db": cmd_reset_state_db,
         "extract-checksums": cmd_extract_checksums,
     }.get(cmd)
     if not handler:
