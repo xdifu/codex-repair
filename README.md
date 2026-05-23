@@ -31,6 +31,8 @@ or, after the first symptom is patched, this one:
 
 ## tl;dr
 
+On Windows, run this from PowerShell or Windows Terminal:
+
 ```powershell
 # 1. Clone this repo and cd into it.
 git clone https://github.com/xdifu/codex-repair.git
@@ -100,6 +102,8 @@ After Bug A is patched, the Codex Desktop GUI imposes a hard-coded **30 s** wait
 Full technical archeology in [`docs/root-cause-analysis.md`](docs/root-cause-analysis.md).
 
 ## Quick start
+
+On Windows, run these from PowerShell or Windows Terminal:
 
 ```powershell
 # Interactive diagnose + repair (recommended; prompts before each step):
