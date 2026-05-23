@@ -47,17 +47,17 @@ If you prefer to call the Python script directly, keep the target Codex home exp
 
 ```bash
 # Native macOS / Linux Codex home:
-python codex-repair.py doctor
-python codex-repair.py fix --apply
+python3 codex-repair.py doctor
+python3 codex-repair.py fix --apply
 
 # WSL bash repairing Windows Store Codex Desktop data:
-python codex-repair.py doctor --codex-home "/mnt/c/Users/<WindowsUser>/.codex"
-python codex-repair.py fix --apply --codex-home "/mnt/c/Users/<WindowsUser>/.codex"
+python3 codex-repair.py doctor --codex-home "/mnt/c/Users/<WindowsUser>/.codex"
+python3 codex-repair.py fix --apply --codex-home "/mnt/c/Users/<WindowsUser>/.codex"
 
 # Useful read-only helpers:
-python codex-repair.py doctor --use-isolated-copy
-python codex-repair.py extract-checksums --json
-python codex-repair.py -h
+python3 codex-repair.py doctor --use-isolated-copy
+python3 codex-repair.py extract-checksums --json
+python3 codex-repair.py -h
 ```
 
 Typical full repair: under 5 minutes start-to-finish, including DB backups.
@@ -145,7 +145,7 @@ codex-repair\
 
 | Flag | Meaning |
 |------|---------|
-| `--codex-home PATH` | Codex home dir. Default `%USERPROFILE%\.codex` on Windows, otherwise `~/.codex`. If running in WSL to repair Windows Store Codex Desktop data, pass `/mnt/c/Users/<WindowsUser>/.codex` explicitly. |
+| `--codex-home PATH` | Codex home dir. Default is the `USERPROFILE` environment variable plus `.codex` when set, otherwise `~/.codex`. If running in WSL to repair Windows Store Codex Desktop data, pass `/mnt/c/Users/<WindowsUser>/.codex` explicitly. |
 | `--binary PATH`     | Backend binary. Default: auto-detect newest in `{codex-home}\bin\wsl\*\codex` (falls back to `bin\codex.exe`). |
 | `--apply`           | Actually mutate the DB. Without this, every subcommand runs dry-run. |
 | `--use-isolated-copy` | Copy the DBs to a temp dir, then operate on copies. The live DB is never opened. Implies dry-run. **Recommended whenever Codex is running.** |
