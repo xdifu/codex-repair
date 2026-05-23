@@ -1548,12 +1548,12 @@ def _run_sqlite_dump_salvage(sqlite3_bin: Path, source_db: Path, recovered_db: P
 
 def cmd_db_health(args: argparse.Namespace) -> int:
     codex_home = Path(args.codex_home).resolve()
+    state_db, logs_db = resolve_db_paths(codex_home)
     con.header(f"codex-repair v{SCRIPT_VERSION} :: db-health")
     con.info(f"CODEX_HOME = {codex_home}")
     rc = EXIT_HEALTHY
-    for name in (STATE_DB_NAME, LOGS_DB_NAME):
-        db = codex_home / name
-        con.section(name)
+    for db in (state_db, logs_db):
+        con.section(db.name)
         if not db.exists():
             con.err(f"missing database: {db}")
             rc = EXIT_NO_DB
@@ -1574,7 +1574,7 @@ def cmd_db_health(args: argparse.Namespace) -> int:
 
 def cmd_recover_state_db(args: argparse.Namespace) -> int:
     codex_home = Path(args.codex_home).resolve()
-    state_db = codex_home / STATE_DB_NAME
+    state_db, _ = resolve_db_paths(codex_home)
     con.header(f"codex-repair v{SCRIPT_VERSION} :: recover-state-db")
     con.info("Close Codex before using --apply. This command never touches session JSONL files.")
     if not state_db.exists():
@@ -1654,7 +1654,7 @@ def cmd_recover_state_db(args: argparse.Namespace) -> int:
 
 def cmd_reset_state_db(args: argparse.Namespace) -> int:
     codex_home = Path(args.codex_home).resolve()
-    state_db = codex_home / STATE_DB_NAME
+    state_db, _ = resolve_db_paths(codex_home)
     con.header(f"codex-repair v{SCRIPT_VERSION} :: reset-state-db")
     con.warn("This moves state_5.sqlite aside so Codex can recreate it on next launch.")
     con.info("It does not delete ~/.codex/sessions or ~/.codex/archived_sessions JSONL files.")
@@ -2233,15 +2233,15 @@ def cmd_quarantine_invalid_jsonl(args: argparse.Namespace) -> int:
     `session_meta` record. It never deletes files.
     """
     codex_home = Path(args.codex_home).resolve()
-    state_db = codex_home / STATE_DB_NAME
+    state_db, _ = resolve_db_paths(codex_home)
     con.header(f"codex-repair v{SCRIPT_VERSION} :: quarantine-invalid-jsonl")
     if not state_db.exists():
         con.err(f"missing {state_db}")
         return EXIT_NO_DB
 
-    health = sqlite_quick_check(state_db)
-    if health != "ok":
-        con.err(f"state_5.sqlite quick_check failed: {health}")
+    ok, msg = sqlite_check(state_db, full=False)
+    if not ok:
+        con.err(f"state_5.sqlite quick_check failed: {msg}")
         con.warn("not moving JSONL files while the state DB is unhealthy")
         return EXIT_ERROR
 
