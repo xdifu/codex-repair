@@ -609,7 +609,7 @@ def resolve_codex_paths(args: argparse.Namespace) -> CodexPaths:
             source = "config"
         elif os.environ.get("CODEX_SQLITE_HOME", "").strip():
             sqlite_home_input = Path(os.environ["CODEX_SQLITE_HOME"]).expanduser()
-            sqlite_home = _expand_path(sqlite_home_input, base=codex_home)
+            sqlite_home = _expand_path(sqlite_home_input)
             source = "env"
         elif (codex_home / "sqlite" / STATE_DB_NAME).exists():
             sqlite_home_input = codex_home / "sqlite"
