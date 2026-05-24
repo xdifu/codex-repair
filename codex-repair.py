@@ -2629,16 +2629,19 @@ def cmd_fix(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _add_global_flags(p: argparse.ArgumentParser) -> None:
+def _add_global_flags(p: argparse.ArgumentParser, *, suppress_defaults: bool = False) -> None:
     """Add the global flags to a (sub)parser so they work in any position."""
+    default_codex_home = argparse.SUPPRESS if suppress_defaults else str(DEFAULT_CODEX_HOME)
+    default_none = argparse.SUPPRESS if suppress_defaults else None
+    default_false = argparse.SUPPRESS if suppress_defaults else False
     p.add_argument(
         "--codex-home",
-        default=str(DEFAULT_CODEX_HOME),
+        default=default_codex_home,
         help=f"Codex home directory (default: {DEFAULT_CODEX_HOME})",
     )
     p.add_argument(
         "--sqlite-home",
-        default=None,
+        default=default_none,
         help=(
             "SQLite state directory (default: config sqlite_home, then "
             "CODEX_SQLITE_HOME, then CODEX_HOME/sqlite when present, then CODEX_HOME)"
@@ -2646,25 +2649,27 @@ def _add_global_flags(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--binary",
-        default=None,
+        default=default_none,
         help="Backend binary path (default: auto-detect native Codex backend, including npm macOS wrappers)",
     )
     p.add_argument(
         "--apply",
         action="store_true",
+        default=default_false,
         help="Actually modify databases (default: dry-run)",
     )
     p.add_argument(
         "--use-isolated-copy",
         action="store_true",
+        default=default_false,
         help="Copy DBs to a temp dir and operate on copies (zero risk to running Codex; implies dry-run)",
     )
     p.add_argument(
         "--sqlite3",
-        default=None,
+        default=default_none,
         help="sqlite3 shell to use for recover-state-db (default: auto-detect Homebrew/MacPorts/PATH)",
     )
-    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true", default=default_false)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2692,12 +2697,12 @@ def build_parser() -> argparse.ArgumentParser:
         ("reset-state-db", "Move state_5.sqlite aside so Codex can recreate it (dry-run unless --apply)"),
     ):
         sp = sub.add_parser(name, help=help_text)
-        _add_global_flags(sp)
+        _add_global_flags(sp, suppress_defaults=True)
     dbh = sub.add_parser("db-health", help="Check SQLite DB health without needing a backend binary")
-    _add_global_flags(dbh)
+    _add_global_flags(dbh, suppress_defaults=True)
     dbh.add_argument("--full", action="store_true", help="run PRAGMA integrity_check instead of quick_check (slower)")
     extract = sub.add_parser("extract-checksums", help="List all migration checksums from binary")
-    _add_global_flags(extract)
+    _add_global_flags(extract, suppress_defaults=True)
     extract.add_argument("--json", action="store_true", help="output JSON")
     return p
 

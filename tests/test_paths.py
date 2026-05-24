@@ -20,6 +20,39 @@ def args(codex_home: Path, sqlite_home: Path | None = None) -> argparse.Namespac
     return argparse.Namespace(codex_home=str(codex_home), sqlite_home=str(sqlite_home) if sqlite_home else None)
 
 
+def parse_cli(argv: list[str]) -> argparse.Namespace:
+    parser = codex_repair.build_parser()
+    parsed = parser.parse_args(argv)
+    codex_repair._merge_global_args(parsed, parser)
+    return parsed
+
+
+class CliParserTests(unittest.TestCase):
+    def test_global_flags_before_subcommand_are_preserved(self) -> None:
+        parsed = parse_cli(["--codex-home", "/tmp/codex", "--sqlite-home", "/tmp/sqlite", "--apply", "fix"])
+
+        self.assertEqual(parsed.cmd, "fix")
+        self.assertEqual(parsed.codex_home, "/tmp/codex")
+        self.assertEqual(parsed.sqlite_home, "/tmp/sqlite")
+        self.assertTrue(parsed.apply)
+
+    def test_global_flags_after_subcommand_are_preserved(self) -> None:
+        parsed = parse_cli(["fix", "--codex-home", "/tmp/codex", "--sqlite-home", "/tmp/sqlite", "--apply"])
+
+        self.assertEqual(parsed.cmd, "fix")
+        self.assertEqual(parsed.codex_home, "/tmp/codex")
+        self.assertEqual(parsed.sqlite_home, "/tmp/sqlite")
+        self.assertTrue(parsed.apply)
+
+    def test_mixed_global_flag_positions_are_preserved(self) -> None:
+        parsed = parse_cli(["--apply", "--codex-home", "/tmp/codex", "fix", "--sqlite-home", "/tmp/sqlite"])
+
+        self.assertEqual(parsed.cmd, "fix")
+        self.assertEqual(parsed.codex_home, "/tmp/codex")
+        self.assertEqual(parsed.sqlite_home, "/tmp/sqlite")
+        self.assertTrue(parsed.apply)
+
+
 class PathResolutionTests(unittest.TestCase):
     def test_cli_sqlite_home_has_highest_priority(self) -> None:
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"CODEX_SQLITE_HOME": "/env/sqlite"}):
