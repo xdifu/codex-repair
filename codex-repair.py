@@ -31,6 +31,8 @@ Safety contract:
     so a running Codex is never touched. Implies dry-run.
   * Every mutation is wrapped in a transaction and preceded by a timestamped
     backup of the affected database (plus its WAL/SHM if present).
+  * CODEX_HOME and SQLite home are resolved separately; sessions are read from
+    CODEX_HOME while state_5/logs_2/goals_1 live under SQLite home.
   * Schema is verified compatible before any checksum is rewritten.
   * Idempotent: re-running on an already-fixed install is a no-op.
 
@@ -47,6 +49,7 @@ import json
 import mmap
 import os
 import platform
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -62,14 +65,23 @@ from typing import Iterable, Iterator, Optional
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "1.0.9"
+SCRIPT_VERSION = "1.0.10"
 
-# The two state databases Codex 0.131 backend uses.
+# SQLite databases used by current Codex builds.
 STATE_DB_NAME = "state_5.sqlite"
 LOGS_DB_NAME = "logs_2.sqlite"
+GOALS_DB_NAME = "goals_1.sqlite"
 
 # Defaults used if auto-detection fails.
-DEFAULT_CODEX_HOME = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".codex"
+def default_codex_home() -> Path:
+    if os.environ.get("CODEX_HOME"):
+        return Path(os.environ["CODEX_HOME"])
+    if os.environ.get("USERPROFILE"):
+        return Path(os.environ["USERPROFILE"]) / ".codex"
+    return Path.home() / ".codex"
+
+
+DEFAULT_CODEX_HOME = default_codex_home()
 
 # Status exit codes for `doctor`.
 EXIT_HEALTHY = 0
@@ -153,8 +165,8 @@ class BackfillStatus:
     first line is a valid `session_meta` record with a session id. Older Codex
     builds can leave `rollout-*.jsonl` files whose first line is not
     `session_meta`; those cannot be inserted into `threads`, so they are tracked
-    separately in `ignored_unindexable_files` and do not make the backfill look
-    stuck by themselves.
+    separately in `ignored_unindexable_files`. A complete backfill marker is not
+    treated as stuck merely because old valid files are absent from `threads`.
     """
 
     status: str
@@ -168,10 +180,68 @@ class BackfillStatus:
 
     @property
     def is_stuck(self) -> bool:
-        # Stuck means Codex says the backfill is incomplete OR there are valid
-        # session JSONL files that can still be inserted into `threads`.
-        # Non-session/legacy JSONL files are intentionally ignored here.
-        return self.status != "complete" or bool(self.unindexed_files)
+        # Startup only blocks while Codex's own backfill marker is incomplete.
+        # Valid-but-unindexed JSONL files with status='complete' can mean stale
+        # metadata, but current Codex does not treat that as a startup gate.
+        return self.status != "complete"
+
+
+@dataclasses.dataclass(frozen=True)
+class DbSpec:
+    """A Codex SQLite database known to this tool."""
+
+    filename: str
+    required: bool
+    label: str
+
+
+DB_SPECS: tuple[DbSpec, ...] = (
+    DbSpec(STATE_DB_NAME, True, "state"),
+    DbSpec(LOGS_DB_NAME, True, "logs"),
+    DbSpec(GOALS_DB_NAME, False, "goals"),
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class CodexPaths:
+    """Resolved Codex data paths.
+
+    `CODEX_HOME` owns config/auth/sessions. `sqlite_home` owns the runtime
+    SQLite databases. They are often the same directory on older installs, but
+    current Windows+WSL installs can intentionally split them.
+    """
+
+    codex_home: Path
+    sqlite_home: Path
+    sqlite_home_source: str
+    codex_home_input: Path
+    sqlite_home_input: Path
+
+    @property
+    def state_db(self) -> Path:
+        return self.sqlite_home / STATE_DB_NAME
+
+    @property
+    def logs_db(self) -> Path:
+        return self.sqlite_home / LOGS_DB_NAME
+
+    @property
+    def goals_db(self) -> Path:
+        return self.sqlite_home / GOALS_DB_NAME
+
+    @property
+    def sessions_dir(self) -> Path:
+        return self.codex_home / "sessions"
+
+    @property
+    def archived_sessions_dir(self) -> Path:
+        return self.codex_home / "archived_sessions"
+
+    def db_path(self, spec: DbSpec) -> Path:
+        return self.sqlite_home / spec.filename
+
+    def existing_db_paths(self) -> list[Path]:
+        return [self.db_path(spec) for spec in DB_SPECS if self.db_path(spec).exists()]
 
 
 # ---------------------------------------------------------------------------
@@ -473,16 +543,148 @@ def find_backend_binary(codex_home: Path) -> Optional[Path]:
         return None
     return candidates[0][2]
 
-def resolve_db_paths(codex_home: Path) -> tuple[Path, Path]:
-    """Resolve state_5.sqlite and logs_2.sqlite paths.
-    If they exist in a 'sqlite' subdirectory under codex_home, use those.
-    Otherwise, default to directly under codex_home.
+def _expand_path(raw: str | Path, base: Optional[Path] = None) -> Path:
+    """Expand env/user markers and resolve a path without requiring it to exist."""
+    text = os.path.expandvars(os.path.expanduser(str(raw)))
+    p = Path(text)
+    if not p.is_absolute() and base is not None:
+        p = base / p
+    return p.resolve(strict=False)
+
+
+def _read_config_sqlite_home(codex_home: Path) -> Optional[str]:
+    """Return top-level `sqlite_home` from config.toml, if present.
+
+    Codex's config parser supports TOML. Python 3.11+ has `tomllib`; for
+    Python 3.10 we keep a narrow fallback that only accepts a top-level
+    quoted string assignment.
     """
-    state_sub = codex_home / "sqlite" / STATE_DB_NAME
-    logs_sub = codex_home / "sqlite" / LOGS_DB_NAME
-    if state_sub.exists():
-        return state_sub, logs_sub
-    return codex_home / STATE_DB_NAME, codex_home / LOGS_DB_NAME
+    config = codex_home / "config.toml"
+    if not config.is_file():
+        return None
+
+    try:
+        import tomllib  # type: ignore[attr-defined]
+
+        with config.open("rb") as f:
+            data = tomllib.load(f)
+        value = data.get("sqlite_home")
+        return value if isinstance(value, str) and value.strip() else None
+    except ModuleNotFoundError:
+        pass
+    except Exception as exc:
+        con.debug(f"could not parse {config} with tomllib: {exc}")
+        return None
+
+    try:
+        for line in config.read_text(encoding="utf-8", errors="replace").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("["):
+                return None
+            m = re.match(r"""^sqlite_home\s*=\s*(['"])(.*?)\1\s*(?:#.*)?$""", stripped)
+            if m:
+                return m.group(2).strip() or None
+    except OSError as exc:
+        con.debug(f"could not read {config}: {exc}")
+    return None
+
+
+def resolve_codex_paths(args: argparse.Namespace) -> CodexPaths:
+    """Resolve Codex home and SQLite home using Codex-compatible precedence."""
+    codex_home_input = Path(args.codex_home).expanduser()
+    codex_home = _expand_path(codex_home_input)
+
+    sqlite_arg = getattr(args, "sqlite_home", None)
+    if sqlite_arg:
+        sqlite_home_input = Path(sqlite_arg).expanduser()
+        sqlite_home = _expand_path(sqlite_home_input, base=codex_home)
+        source = "cli"
+    else:
+        config_sqlite_home = _read_config_sqlite_home(codex_home)
+        if config_sqlite_home:
+            sqlite_home_input = Path(config_sqlite_home).expanduser()
+            sqlite_home = _expand_path(sqlite_home_input, base=codex_home)
+            source = "config"
+        elif os.environ.get("CODEX_SQLITE_HOME", "").strip():
+            sqlite_home_input = Path(os.environ["CODEX_SQLITE_HOME"]).expanduser()
+            sqlite_home = _expand_path(sqlite_home_input, base=codex_home)
+            source = "env"
+        elif (codex_home / "sqlite" / STATE_DB_NAME).exists():
+            sqlite_home_input = codex_home / "sqlite"
+            sqlite_home = sqlite_home_input.resolve(strict=False)
+            source = "legacy"
+        else:
+            sqlite_home_input = codex_home
+            sqlite_home = codex_home
+            source = "default"
+
+    return CodexPaths(
+        codex_home=codex_home,
+        sqlite_home=sqlite_home,
+        sqlite_home_source=source,
+        codex_home_input=codex_home_input,
+        sqlite_home_input=sqlite_home_input,
+    )
+
+
+def resolve_db_paths(codex_home: Path, sqlite_home: Optional[Path] = None) -> tuple[Path, Path]:
+    """Backward-compatible helper for callers that only need state/log DBs."""
+    if sqlite_home is None:
+        sqlite_home = codex_home / "sqlite" if (codex_home / "sqlite" / STATE_DB_NAME).exists() else codex_home
+    return sqlite_home / STATE_DB_NAME, sqlite_home / LOGS_DB_NAME
+
+
+def is_wsl() -> bool:
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        text = Path("/proc/version").read_text(encoding="utf-8", errors="ignore").lower()
+        return "microsoft" in text or "wsl" in text
+    except OSError:
+        return False
+
+
+def is_mnt_drive_path(path: Path) -> bool:
+    p = path.resolve(strict=False).as_posix()
+    return bool(re.match(r"^/mnt/[A-Za-z](?:/|$)", p))
+
+
+def wsl_sqlite_layout_status(paths: CodexPaths) -> str:
+    """Classify WSL SQLite layout as 'risk', 'split', or 'none'."""
+    if not is_wsl():
+        return "none"
+
+    codex_mnt = is_mnt_drive_path(paths.codex_home)
+    sqlite_mnt = is_mnt_drive_path(paths.sqlite_home)
+
+    if sqlite_mnt:
+        return "risk"
+    if codex_mnt:
+        return "split"
+    return "none"
+
+
+def emit_wsl_sqlite_layout_note(paths: CodexPaths) -> None:
+    """Warn about Windows/WSL shared SQLite layouts tracked in #24348."""
+    status = wsl_sqlite_layout_status(paths)
+    codex_symlink_to_mnt = (
+        paths.codex_home_input.is_symlink()
+        and is_mnt_drive_path(paths.codex_home_input.resolve(strict=False))
+    )
+
+    if status == "risk":
+        con.warn("Detected WSL using SQLite state on /mnt/<drive>.")
+        con.warn("This matches the Windows/WSL shared SQLite risk tracked in openai/codex#24348.")
+        con.warn(
+            "Checksum repair may be temporary; prefer a WSL-native CODEX_SQLITE_HOME "
+            "such as /home/<user>/.codex-sqlite."
+        )
+        if codex_symlink_to_mnt:
+            con.info("CODEX_HOME input is a symlink to /mnt/<drive>, so SQLite is shared with Windows.")
+    elif status == "split":
+        con.ok("WSL split-state layout detected: sessions/config are shared, SQLite is WSL-native.")
 
 
 def detect_rollout_path_scheme(state_db: Path) -> str:
@@ -1547,16 +1749,20 @@ def _run_sqlite_dump_salvage(sqlite3_bin: Path, source_db: Path, recovered_db: P
 
 
 def cmd_db_health(args: argparse.Namespace) -> int:
-    codex_home = Path(args.codex_home).resolve()
-    state_db, logs_db = resolve_db_paths(codex_home)
+    paths = resolve_codex_paths(args)
     con.header(f"codex-repair v{SCRIPT_VERSION} :: db-health")
-    con.info(f"CODEX_HOME = {codex_home}")
+    con.info(f"CODEX_HOME  = {paths.codex_home}")
+    con.info(f"SQLite home = {paths.sqlite_home} (source: {paths.sqlite_home_source})")
     rc = EXIT_HEALTHY
-    for db in (state_db, logs_db):
+    for spec in DB_SPECS:
+        db = paths.db_path(spec)
         con.section(db.name)
         if not db.exists():
-            con.err(f"missing database: {db}")
-            rc = EXIT_NO_DB
+            if spec.required:
+                con.err(f"missing database: {db}")
+                rc = EXIT_NO_DB
+            else:
+                con.info(f"optional database missing: {db}")
             continue
         con.info(f"path = {db}")
         con.info(f"size = {db.stat().st_size:,} bytes")
@@ -1573,9 +1779,11 @@ def cmd_db_health(args: argparse.Namespace) -> int:
 
 
 def cmd_recover_state_db(args: argparse.Namespace) -> int:
-    codex_home = Path(args.codex_home).resolve()
-    state_db, _ = resolve_db_paths(codex_home)
+    paths = resolve_codex_paths(args)
+    state_db = paths.state_db
     con.header(f"codex-repair v{SCRIPT_VERSION} :: recover-state-db")
+    con.info(f"CODEX_HOME  = {paths.codex_home}")
+    con.info(f"SQLite home = {paths.sqlite_home} (source: {paths.sqlite_home_source})")
     con.info("Close Codex before using --apply. This command never touches session JSONL files.")
     if not state_db.exists():
         con.err(f"missing {state_db}")
@@ -1587,7 +1795,7 @@ def cmd_recover_state_db(args: argparse.Namespace) -> int:
         con.info("fallback reset: python3 codex-repair.py reset-state-db --apply")
         return EXIT_ERROR
 
-    repair_dir = _timestamped_repair_dir(codex_home, "state_5-recover" if args.apply else "state_5-recover-dryrun")
+    repair_dir = _timestamped_repair_dir(paths.sqlite_home, "state_5-recover" if args.apply else "state_5-recover-dryrun")
     con.info(f"repair directory = {repair_dir}")
     _copy_existing(_state_db_sidecars(state_db), repair_dir)
     con.ok("copied current state DB and sidecars into repair directory")
@@ -1653,16 +1861,18 @@ def cmd_recover_state_db(args: argparse.Namespace) -> int:
 
 
 def cmd_reset_state_db(args: argparse.Namespace) -> int:
-    codex_home = Path(args.codex_home).resolve()
-    state_db, _ = resolve_db_paths(codex_home)
+    paths = resolve_codex_paths(args)
+    state_db = paths.state_db
     con.header(f"codex-repair v{SCRIPT_VERSION} :: reset-state-db")
+    con.info(f"CODEX_HOME  = {paths.codex_home}")
+    con.info(f"SQLite home = {paths.sqlite_home} (source: {paths.sqlite_home_source})")
     con.warn("This moves state_5.sqlite aside so Codex can recreate it on next launch.")
     con.info("It does not delete ~/.codex/sessions or ~/.codex/archived_sessions JSONL files.")
     existing = [p for p in _state_db_sidecars(state_db) if p.exists()]
     if not existing:
         con.ok("no state_5.sqlite files exist; nothing to reset")
         return EXIT_HEALTHY
-    repair_dir = codex_home / f"state_5-reset-{time.strftime('%Y%m%d-%H%M%S')}"
+    repair_dir = paths.sqlite_home / f"state_5-reset-{time.strftime('%Y%m%d-%H%M%S')}"
     if not args.apply:
         con.info(f"would create {repair_dir}")
         for p in existing:
@@ -1681,20 +1891,26 @@ def cmd_reset_state_db(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    codex_home = Path(args.codex_home).resolve()
+    paths = resolve_codex_paths(args)
     explicit_binary = Path(args.binary).expanduser().resolve() if args.binary else None
-    binary = explicit_binary if explicit_binary else find_backend_binary(codex_home)
+    binary = explicit_binary if explicit_binary else find_backend_binary(paths.codex_home)
 
     con.header(f"codex-repair v{SCRIPT_VERSION} :: doctor")
     con.section("Environment")
-    con.info(f"CODEX_HOME = {codex_home}")
+    con.info(f"CODEX_HOME  = {paths.codex_home}")
+    con.info(f"SQLite home = {paths.sqlite_home} (source: {paths.sqlite_home_source})")
+    con.info(f"Sessions    = {paths.sessions_dir}")
+    emit_wsl_sqlite_layout_note(paths)
 
-    state_db, logs_db = resolve_db_paths(codex_home)
     missing_db = False
-    for db in (state_db, logs_db):
+    for spec in DB_SPECS:
+        db = paths.db_path(spec)
         if not db.exists():
-            con.err(f"missing database: {db}")
-            missing_db = True
+            if spec.required:
+                con.err(f"missing database: {db}")
+                missing_db = True
+            else:
+                con.info(f"optional database missing: {db.name}")
         else:
             con.info(f"db         = {db.name} ({db.stat().st_size:,} bytes)")
     if missing_db:
@@ -1704,13 +1920,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if args.use_isolated_copy:
         cache = Path(tempfile.mkdtemp(prefix="codex-repair-doctor-"))
         con.section(f"Isolated copy mode → {cache}")
-        state_db = isolate_copy(state_db, cache)
-        logs_db = isolate_copy(logs_db, cache)
+        for db in paths.existing_db_paths():
+            isolate_copy(db, cache)
+        paths = dataclasses.replace(
+            paths,
+            sqlite_home=cache,
+            sqlite_home_input=cache,
+            sqlite_home_source=f"{paths.sqlite_home_source}+isolated",
+        )
         con.ok("copied DBs to isolated location; original DB is untouched")
 
     con.section("SQLite health")
     db_malformed = False
-    for db in (state_db, logs_db):
+    for db in paths.existing_db_paths():
         ok, msg = sqlite_check(db, full=False)
         if ok:
             con.ok(f"{db.name}: quick_check ok")
@@ -1731,7 +1953,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         elif not db_malformed:
             con.section("Scanning binary for migration anchors")
             t0 = time.time()
-            descriptions = _collect_all_descriptions(state_db, logs_db)
+            descriptions = _collect_all_descriptions(*paths.existing_db_paths())
             con.debug(f"  using {len(descriptions)} known descriptions as locators")
             anchors = scan_binary_anchors(binary, descriptions_hint=descriptions)
             con.ok(f"found {len(anchors)} (sql, sha384) anchors in {time.time()-t0:.1f}s")
@@ -1752,9 +1974,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         con.warn("skipped because at least one database failed SQLite quick_check")
     elif binary_ok:
         all_diffs: list[ChecksumDiff] = []
-        for db in (state_db, logs_db):
+        for spec in DB_SPECS:
+            db = paths.db_path(spec)
+            if not db.exists():
+                continue
             con.section(f"Checksum drift check :: {db.name}")
             diffs = compute_checksum_diffs(db, binary, anchors)
+            if (
+                not spec.required
+                and diffs
+                and all(d.binary_anchor is None for d in diffs)
+            ):
+                con.warn(f"skipping optional {db.name}: no matching migration anchors found in selected backend")
+                continue
             if not diffs:
                 con.ok("all migration checksums match binary")
                 continue
@@ -1787,7 +2019,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         con.warn("skipped because state_5.sqlite failed quick_check")
     else:
         try:
-            bf = collect_backfill_status(codex_home, state_db)
+            bf = collect_backfill_status(paths.codex_home, paths.state_db)
         except sqlite3.Error as exc:
             con.err(f"could not read backfill_state: {exc}")
             con.warn("state_5.sqlite could be corrupt or being read while Codex is mutating it")
@@ -1806,16 +2038,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             if len(bf.ignored_unindexable_files) > 5:
                 con.info(f"  ... {len(bf.ignored_unindexable_files) - 5} more ignored")
         if bf.is_stuck:
-            con.warn("backfill appears stuck (status incomplete or valid unindexed session files exist)")
+            con.warn("backfill appears stuck (status incomplete)")
             con.warn("→ on next Codex launch, 30s startup timeout may fire")
             if overall_exit == EXIT_HEALTHY:
                 overall_exit = EXIT_BACKFILL_STUCK
             elif overall_exit == EXIT_CHECKSUM_DRIFT:
                 overall_exit = EXIT_BOTH
         else:
+            if bf.unindexed_files:
+                con.warn(
+                    "backfill is marked complete; valid unindexed JSONL files may mean "
+                    "thread metadata is stale, but startup should not block"
+                )
             if bf.ignored_unindexable_files:
                 con.ok("backfill complete; remaining unindexed JSONL files are non-session/legacy files")
-            else:
+            elif not bf.unindexed_files:
                 con.ok("backfill complete, no unindexed files")
 
     con.section("Summary")
@@ -1850,17 +2087,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_fix_checksums(args: argparse.Namespace) -> int:
-    codex_home = Path(args.codex_home).resolve()
-    binary = Path(args.binary).resolve() if args.binary else find_backend_binary(codex_home)
+    paths = resolve_codex_paths(args)
+    binary = Path(args.binary).resolve() if args.binary else find_backend_binary(paths.codex_home)
     if not binary:
         con.err("no backend binary found")
         return EXIT_NO_BINARY
 
     con.header(f"codex-repair v{SCRIPT_VERSION} :: fix-checksums")
-    state_db, logs_db = resolve_db_paths(codex_home)
+    con.info(f"CODEX_HOME  = {paths.codex_home}")
+    con.info(f"SQLite home = {paths.sqlite_home} (source: {paths.sqlite_home_source})")
 
     con.section("Scanning binary for expected checksums...")
-    descriptions = _collect_all_descriptions(state_db, logs_db)
+    descriptions = _collect_all_descriptions(*paths.existing_db_paths())
     anchors = scan_binary_anchors(binary, descriptions_hint=descriptions)
     con.ok(f"found {len(anchors)} anchors")
     if not anchors:
@@ -1868,20 +2106,38 @@ def cmd_fix_checksums(args: argparse.Namespace) -> int:
         con.warn("refusing to compare or rewrite checksums against a launcher/wrapper")
         return EXIT_NO_BINARY
 
-    operate_on_state = state_db
-    operate_on_logs = logs_db
     if args.use_isolated_copy:
         cache = Path(tempfile.mkdtemp(prefix="codex-repair-fix-"))
         con.section(f"Isolated copy mode → {cache}")
-        operate_on_state = isolate_copy(state_db, cache)
-        operate_on_logs = isolate_copy(logs_db, cache)
+        for db in paths.existing_db_paths():
+            isolate_copy(db, cache)
+        paths = dataclasses.replace(
+            paths,
+            sqlite_home=cache,
+            sqlite_home_input=cache,
+            sqlite_home_source=f"{paths.sqlite_home_source}+isolated",
+        )
         con.ok("real DBs untouched; operating on isolated copies (forces dry-run)")
         args.apply = False
 
     fixes_planned: list[ChecksumDiff] = []
-    for db in (operate_on_state, operate_on_logs):
+    for spec in DB_SPECS:
+        db = paths.db_path(spec)
+        if not db.exists():
+            if spec.required:
+                con.err(f"missing database: {db}")
+                return EXIT_NO_DB
+            con.info(f"optional database missing: {db.name}")
+            continue
         con.section(f"Checking {db.name}")
         diffs = compute_checksum_diffs(db, binary, anchors)
+        if (
+            not spec.required
+            and diffs
+            and all(d.binary_anchor is None for d in diffs)
+        ):
+            con.warn(f"skipping optional {db.name}: no matching migration anchors found in selected backend")
+            continue
         if not diffs:
             con.ok("no drift")
             continue
@@ -2021,10 +2277,13 @@ def _extract_first_user_message(jsonl: Path, max_lines: int = 200) -> Optional[s
 
 
 def cmd_manual_backfill(args: argparse.Namespace) -> int:
-    codex_home = Path(args.codex_home).resolve()
-    state_db, _ = resolve_db_paths(codex_home)
+    paths = resolve_codex_paths(args)
+    state_db = paths.state_db
 
     con.header(f"codex-repair v{SCRIPT_VERSION} :: manual-backfill")
+    con.info(f"CODEX_HOME  = {paths.codex_home}")
+    con.info(f"SQLite home = {paths.sqlite_home} (source: {paths.sqlite_home_source})")
+    con.info(f"Sessions    = {paths.sessions_dir}")
     if not state_db.exists():
         con.err(f"missing {state_db}")
         return EXIT_NO_DB
@@ -2053,8 +2312,8 @@ def cmd_manual_backfill(args: argparse.Namespace) -> int:
     indexed = read_indexed_rollout_paths(operate_db)
     con.info(f"currently indexed: {len(indexed)} threads")
 
-    sessions_dir = codex_home / "sessions"
-    archived_dir = codex_home / "archived_sessions"
+    sessions_dir = paths.sessions_dir
+    archived_dir = paths.archived_sessions_dir
     all_files: list[Path] = []
     if sessions_dir.is_dir():
         all_files.extend(sessions_dir.rglob("*.jsonl"))
@@ -2199,7 +2458,7 @@ def cmd_manual_backfill(args: argparse.Namespace) -> int:
             newest = max(all_files, key=lambda p: p.stat().st_mtime, default=None)
             watermark = None
             if newest:
-                rel = newest.relative_to(codex_home).as_posix()
+                rel = newest.relative_to(paths.codex_home).as_posix()
                 watermark = rel
             now = int(time.time())
             cur.execute(
@@ -2232,9 +2491,11 @@ def cmd_quarantine_invalid_jsonl(args: argparse.Namespace) -> int:
     and that cannot be indexed because the first line is not a usable
     `session_meta` record. It never deletes files.
     """
-    codex_home = Path(args.codex_home).resolve()
-    state_db, _ = resolve_db_paths(codex_home)
+    paths = resolve_codex_paths(args)
+    state_db = paths.state_db
     con.header(f"codex-repair v{SCRIPT_VERSION} :: quarantine-invalid-jsonl")
+    con.info(f"CODEX_HOME  = {paths.codex_home}")
+    con.info(f"SQLite home = {paths.sqlite_home} (source: {paths.sqlite_home_source})")
     if not state_db.exists():
         con.err(f"missing {state_db}")
         return EXIT_NO_DB
@@ -2247,7 +2508,7 @@ def cmd_quarantine_invalid_jsonl(args: argparse.Namespace) -> int:
 
     indexed = read_indexed_rollout_paths(state_db)
     scheme = detect_rollout_path_scheme(state_db)
-    all_files, _sessions_dir, _archived_dir = collect_jsonl_files(codex_home)
+    all_files, _sessions_dir, _archived_dir = collect_jsonl_files(paths.codex_home)
 
     candidates: list[tuple[Path, str]] = []
     for fp in all_files:
@@ -2264,7 +2525,7 @@ def cmd_quarantine_invalid_jsonl(args: argparse.Namespace) -> int:
         return EXIT_HEALTHY
 
     for p, reason in candidates[:10]:
-        display = p.relative_to(codex_home) if path_is_relative_to(p, codex_home) else p
+        display = p.relative_to(paths.codex_home) if path_is_relative_to(p, paths.codex_home) else p
         con.info(f"  {display}: {reason}")
     if len(candidates) > 10:
         con.info(f"  ... {len(candidates)-10} more")
@@ -2274,10 +2535,10 @@ def cmd_quarantine_invalid_jsonl(args: argparse.Namespace) -> int:
         return EXIT_HEALTHY
 
     ts = time.strftime("%Y%m%d-%H%M%S")
-    quarantine_dir = codex_home / f"invalid-jsonl-quarantine-{ts}"
+    quarantine_dir = paths.codex_home / f"invalid-jsonl-quarantine-{ts}"
     manifest: list[dict[str, str]] = []
     for src, reason in candidates:
-        rel = src.relative_to(codex_home) if path_is_relative_to(src, codex_home) else Path(src.name)
+        rel = src.relative_to(paths.codex_home) if path_is_relative_to(src, paths.codex_home) else Path(src.name)
         dest = quarantine_dir / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dest))
@@ -2295,8 +2556,8 @@ def cmd_quarantine_invalid_jsonl(args: argparse.Namespace) -> int:
 
 
 def cmd_extract_checksums(args: argparse.Namespace) -> int:
-    codex_home = Path(args.codex_home).resolve()
-    binary = Path(args.binary).resolve() if args.binary else find_backend_binary(codex_home)
+    paths = resolve_codex_paths(args)
+    binary = Path(args.binary).resolve() if args.binary else find_backend_binary(paths.codex_home)
     if not binary:
         con.err("no backend binary found")
         return EXIT_NO_BINARY
@@ -2304,8 +2565,7 @@ def cmd_extract_checksums(args: argparse.Namespace) -> int:
     con.header(f"codex-repair v{SCRIPT_VERSION} :: extract-checksums")
     con.info(f"binary = {binary}")
     # Use DB descriptions as locator if DBs exist; otherwise fallback algorithm runs.
-    state_db, logs_db = resolve_db_paths(codex_home)
-    descriptions = _collect_all_descriptions(state_db, logs_db)
+    descriptions = _collect_all_descriptions(*paths.existing_db_paths())
     anchors = scan_binary_anchors(binary, descriptions_hint=descriptions)
     if args.json:
         out = [
@@ -2371,6 +2631,14 @@ def _add_global_flags(p: argparse.ArgumentParser) -> None:
         "--codex-home",
         default=str(DEFAULT_CODEX_HOME),
         help=f"Codex home directory (default: {DEFAULT_CODEX_HOME})",
+    )
+    p.add_argument(
+        "--sqlite-home",
+        default=None,
+        help=(
+            "SQLite state directory (default: config sqlite_home, then "
+            "CODEX_SQLITE_HOME, then CODEX_HOME/sqlite when present, then CODEX_HOME)"
+        ),
     )
     p.add_argument(
         "--binary",
@@ -2439,6 +2707,7 @@ def _merge_global_args(args: argparse.Namespace, parser: argparse.ArgumentParser
     # Defensive: ensure attributes exist with their defaults if argparse missed.
     for attr, default in (
         ("codex_home", str(DEFAULT_CODEX_HOME)),
+        ("sqlite_home", None),
         ("binary", None),
         ("apply", False),
         ("use_isolated_copy", False),

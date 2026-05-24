@@ -45,16 +45,17 @@ cd codex-repair
 .\repair.ps1 -Mode fix -Apply
 ```
 
-If you prefer to call the Python script directly, keep the target Codex home explicit:
+If you prefer to call the Python script directly:
 
 ```bash
-# Native macOS / Linux Codex home:
+# Native macOS / Linux, or WSL repairing the active Codex environment:
+# honors CODEX_SQLITE_HOME when set.
 python3 codex-repair.py doctor
 python3 codex-repair.py fix --apply
 
-# WSL bash repairing Windows Store Codex Desktop data:
+# WSL bash explicitly inspecting the Windows-backed root DB:
 python3 codex-repair.py doctor --codex-home "/mnt/c/Users/<WindowsUser>/.codex"
-python3 codex-repair.py fix --apply --codex-home "/mnt/c/Users/<WindowsUser>/.codex"
+python3 codex-repair.py doctor --codex-home "/mnt/c/Users/<WindowsUser>/.codex" --sqlite-home "/mnt/c/Users/<WindowsUser>/.codex"
 
 # Useful read-only helpers:
 python3 codex-repair.py doctor --use-isolated-copy
@@ -63,6 +64,11 @@ python3 codex-repair.py -h
 ```
 
 Typical full repair: under 5 minutes start-to-finish, including DB backups.
+
+Path note: `CODEX_HOME` stores config/auth/sessions; `CODEX_SQLITE_HOME` (or
+`--sqlite-home`) stores the runtime SQLite DBs. This toolkit follows that split
+when present, and detects Windows/WSL shared SQLite state layouts tracked in
+[`openai/codex#24348`](https://github.com/openai/codex/issues/24348).
 
 ## Symptoms covered (verbatim error text for search engines)
 
@@ -149,7 +155,8 @@ codex-repair\
 
 | Flag | Meaning |
 |------|---------|
-| `--codex-home PATH` | Codex home dir. Default is the `USERPROFILE` environment variable plus `.codex` when set, otherwise `~/.codex`. If running in WSL to repair Windows Store Codex Desktop data, pass `/mnt/c/Users/<WindowsUser>/.codex` explicitly. |
+| `--codex-home PATH` | Codex home dir for config/auth/sessions. Default is `CODEX_HOME` when set, then the `USERPROFILE` environment variable plus `.codex` when set, otherwise `~/.codex`. |
+| `--sqlite-home PATH` | SQLite state dir. Default is `config.toml` `sqlite_home`, then `CODEX_SQLITE_HOME`, then `CODEX_HOME\sqlite` when present, otherwise `CODEX_HOME`. |
 | `--binary PATH`     | Backend binary. Default: auto-detect newest in `{codex-home}\bin\wsl\*\codex` (falls back to `bin\codex.exe`). |
 | `--apply`           | Actually mutate the DB. Without this, every subcommand runs dry-run. |
 | `--use-isolated-copy` | Copy the DBs to a temp dir, then operate on copies. The live DB is never opened. Implies dry-run. **Recommended whenever Codex is running.** |
@@ -168,7 +175,7 @@ codex-repair\
 | `30` | User aborted. |
 | `1`  | Other error. |
 
-If WSL prints `CODEX_HOME = /home/<you>/.codex` and then `no backend binary found`, it is looking at the WSL Codex home, not the Windows Store Codex Desktop home. Use `repair.ps1` from PowerShell, or pass `--codex-home "/mnt/c/Users/<WindowsUser>/.codex"` explicitly.
+If WSL prints `CODEX_HOME = /home/<you>/.codex` and then `no backend binary found`, it is looking at the WSL Codex home, not the Windows Store Codex Desktop home. Use `repair.ps1` from PowerShell, or pass `--codex-home "/mnt/c/Users/<WindowsUser>/.codex"` explicitly. If you intentionally want to inspect the Windows-backed root SQLite DB from WSL, also pass `--sqlite-home "/mnt/c/Users/<WindowsUser>/.codex"`.
 
 ## Safety guarantees
 
@@ -178,7 +185,7 @@ If WSL prints `CODEX_HOME = /home/<you>/.codex` and then `no backend binary foun
 4. **Atomic transactions.** Every mutation is wrapped in `BEGIN IMMEDIATE … COMMIT` and rolled back on any error.
 5. **Idempotent.** Running `fix --apply` twice in a row is a no-op the second time.
 6. **`--use-isolated-copy`.** When passed, the script copies the DBs to a private temp directory and operates only on those. Your real DB is never touched, even read-only. Useful for testing while Codex is running.
-7. **Conversation data is never touched.** This toolkit only reads/writes `state_5.sqlite` and `logs_2.sqlite` (metadata / indexing DBs). Your actual chat history under `~/.codex/sessions/*.jsonl` is read-only the entire time.
+7. **Conversation data is never touched.** This toolkit only reads/writes Codex SQLite metadata DBs (`state_5.sqlite`, `logs_2.sqlite`, and `goals_1.sqlite` when present). Your actual chat history under `~/.codex/sessions/*.jsonl` is read-only the entire time.
 
 ## When to use this
 
@@ -200,6 +207,7 @@ The bug being repaired here is **OpenAI's**, not your computer's. Public trackin
 - [**#23787**](https://github.com/openai/codex/issues/23787) — `Codex App crashes after 0.130 → 0.131 auto-update: logs_2.sqlite migrations modified in place (sqlx checksum drift) + 30s GUI backfill cap incompatible with 900s backend lease` (**this toolkit's primary upstream issue**; covers both Bug A and Bug B with full evidence + proposed fixes)
 - [**#23777**](https://github.com/openai/codex/issues/23777) — `Windows Desktop WSL app-server fails to launch due to CRLF/LF SQLx migration checksum mismatch` (sibling issue; first to identify the CRLF/LF root cause for Bug A — credit [@MisterRound](https://github.com/MisterRound))
 - [#23251](https://github.com/openai/codex/issues/23251) — `WSL CLI cannot share Windows Codex App CODEX_HOME: migration 1 was previously applied but has been modified` (open; earlier subset of the same root cause filed by [@xdifu](https://github.com/xdifu))
+- [#24348](https://github.com/openai/codex/issues/24348) — `VS Code extension WSL agent fails when Windows and WSL share CODEX_HOME on C drive SQLite state` (this toolkit detects the risky shared-SQLite layout and follows `CODEX_SQLITE_HOME` when set)
 - [#17304](https://github.com/openai/codex/issues/17304) — `Desktop project sidebar hides active threads after state DB migration drift` (open; downstream symptom on Mac)
 - [#18364](https://github.com/openai/codex/issues/18364), [#20608](https://github.com/openai/codex/issues/20608) — Mac-side observations of the same migration-drift family
 - [#17540](https://github.com/openai/codex/issues/17540), [#19873](https://github.com/openai/codex/issues/19873) — Windows sidebar disappearance after update

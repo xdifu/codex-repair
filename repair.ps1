@@ -6,6 +6,7 @@
 #   .\repair.ps1 -Mode fix           # dry-run repair plan
 #   .\repair.ps1 -Mode fix -Apply    # actually apply fix
 #   .\repair.ps1 -Mode fix -Isolated # zero-risk dry-run against DB copies
+#   .\repair.ps1 -Mode doctor -SQLiteHome "C:\Users\<user>\.codex"
 #
 # Safety:
 # * By default this script is INTERACTIVE: it shows the diagnose result and
@@ -22,6 +23,7 @@ param(
     [switch]$Apply,
     [switch]$Isolated,
     [string]$CodexHome = "$env:USERPROFILE\.codex",
+    [string]$SQLiteHome,
     [string]$Binary,
     [switch]$NoPrompt
 )
@@ -76,6 +78,7 @@ if (-not (Test-Path -LiteralPath $pyScript)) {
 
 # Build base argument list for the Python script
 $pyArgs = @("--codex-home", $CodexHome)
+if ($SQLiteHome) { $pyArgs += @("--sqlite-home", $SQLiteHome) }
 if ($Binary)    { $pyArgs += @("--binary", $Binary) }
 if ($VerbosePreference -ne 'SilentlyContinue') { $pyArgs += "-v" }
 if ($Isolated)  { $pyArgs += "--use-isolated-copy" }
