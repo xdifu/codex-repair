@@ -35,6 +35,16 @@ class PathResolutionTests(unittest.TestCase):
             self.assertEqual(paths.sqlite_home_source, "cli")
             self.assertEqual(paths.sqlite_home, (root / "cli-sqlite").resolve())
 
+    def test_relative_cli_sqlite_home_resolves_from_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {}, clear=True):
+            codex_home = Path(td) / "codex"
+            codex_home.mkdir()
+
+            paths = codex_repair.resolve_codex_paths(args(codex_home, Path("snapshot")))
+
+            self.assertEqual(paths.sqlite_home_source, "cli")
+            self.assertEqual(paths.sqlite_home, Path("snapshot").resolve(strict=False))
+
     def test_config_sqlite_home_beats_env(self) -> None:
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"CODEX_SQLITE_HOME": "/env/sqlite"}):
             root = Path(td)

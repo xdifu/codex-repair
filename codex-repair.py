@@ -599,7 +599,7 @@ def resolve_codex_paths(args: argparse.Namespace) -> CodexPaths:
     sqlite_arg = getattr(args, "sqlite_home", None)
     if sqlite_arg:
         sqlite_home_input = Path(sqlite_arg).expanduser()
-        sqlite_home = _expand_path(sqlite_home_input, base=codex_home)
+        sqlite_home = _expand_path(sqlite_home_input)
         source = "cli"
     else:
         config_sqlite_home = _read_config_sqlite_home(codex_home)
@@ -647,8 +647,12 @@ def is_wsl() -> bool:
 
 
 def is_mnt_drive_path(path: Path) -> bool:
-    p = path.resolve(strict=False).as_posix()
-    return bool(re.match(r"^/mnt/[A-Za-z](?:/|$)", p))
+    candidates = [path.as_posix()]
+    try:
+        candidates.append(path.resolve(strict=False).as_posix())
+    except OSError:
+        pass
+    return any(bool(re.match(r"^/mnt/[A-Za-z](?:/|$)", p)) for p in candidates)
 
 
 def wsl_sqlite_layout_status(paths: CodexPaths) -> str:
