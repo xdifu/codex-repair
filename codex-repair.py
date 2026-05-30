@@ -65,7 +65,7 @@ from typing import Iterable, Iterator, Optional
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_VERSION = "1.0.10"
+SCRIPT_VERSION = "1.0.11"
 
 # SQLite databases used by current Codex builds.
 STATE_DB_NAME = "state_5.sqlite"
@@ -395,6 +395,18 @@ def looks_like_codex_node_wrapper(path: Path) -> bool:
     mostly_text = bool(sample) and printable / len(sample) > 0.90
     lower = sample.lower()
     return mostly_text and any(tok in lower for tok in (b"node", b"npm", b"/bin/sh", b"javascript"))
+
+
+def warn_no_migration_anchors(binary: Path) -> None:
+    """Explain why checksum checks cannot proceed without blaming healthy DBs."""
+    if is_native_executable(binary):
+        con.warn(
+            "selected backend is native, but no extractable migration anchors were found; "
+            "newer Codex builds may embed migrations differently"
+        )
+    else:
+        con.warn("selected backend may be a launcher/wrapper rather than the native Rust Codex binary")
+    con.warn("checksum checks are skipped because expected migration checksums are unavailable")
 
 
 def codex_package_root_from_wrapper(wrapper: Path) -> Optional[Path]:
@@ -1965,7 +1977,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 binary_ok = True
             else:
                 con.err("no migration anchors found in selected backend")
-                con.warn("this usually means the selected file is a launcher/wrapper, not the native Rust Codex binary")
+                warn_no_migration_anchors(binary)
         else:
             con.warn("skipping binary checksum scan because a DB failed quick_check")
     else:
@@ -2013,7 +2025,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 overall_exit = EXIT_CHECKSUM_DRIFT
     else:
         con.section("Checksum drift check")
-        con.warn("skipped because no usable native backend binary was found")
+        if binary:
+            con.warn("skipped because expected migration checksums are unavailable")
+        else:
+            con.warn("skipped because no native backend binary was found")
         overall_exit = EXIT_NO_BINARY
 
     con.section("Backfill state")
@@ -2070,7 +2085,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if overall_exit == EXIT_HEALTHY:
         con.ok("install is healthy — no action needed")
     elif overall_exit == EXIT_NO_BINARY:
-        con.warn("detected: no usable native backend binary, so checksum checks were skipped")
+        if binary:
+            con.warn("detected: checksum anchors unavailable, so checksum checks were skipped")
+        else:
+            con.warn("detected: no native backend binary, so checksum checks were skipped")
         con.info("database health/backfill checks above are still valid")
     else:
         names = {
@@ -2107,7 +2125,8 @@ def cmd_fix_checksums(args: argparse.Namespace) -> int:
     con.ok(f"found {len(anchors)} anchors")
     if not anchors:
         con.err("no migration anchors found in selected backend")
-        con.warn("refusing to compare or rewrite checksums against a launcher/wrapper")
+        warn_no_migration_anchors(binary)
+        con.warn("refusing to compare or rewrite checksums without expected checksums")
         return EXIT_NO_BINARY
 
     if args.use_isolated_copy:
